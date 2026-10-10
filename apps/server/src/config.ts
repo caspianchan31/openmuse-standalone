@@ -44,6 +44,8 @@ export interface Config {
   agentUrl?: string;
   agentToken?: string;
   intelligenceApiKey?: string;
+  // Standalone: optional age limit for locally stored chat history (CHAT_RETENTION_DAYS).
+  chatRetentionDays?: number;
   googleClientId?: string;
   googleClientSecret?: string;
   googleRedirectUri: string;
@@ -77,14 +79,23 @@ export function required(name: string, message: string, value = process.env[name
   return value.trim();
 }
 
-export function assertApiDeploymentConfig(
-  config: Config,
-): asserts config is Config & { intelligenceApiKey: string } {
-  required(
-    "CPK_INTELLIGENCE_API_KEY",
-    intelligenceKeyRequiredMessage,
-    config.intelligenceApiKey ?? "",
-  );
+// Standalone: the Intelligence key is optional. Without it chat runs in local mode: the
+// CopilotKit runtime uses SSE with this server's own runner and threads live in its database.
+export type ChatBackend = "intelligence" | "local";
+export function chatBackend(config: Pick<Config, "intelligenceApiKey">): ChatBackend {
+  return config.intelligenceApiKey?.trim() ? "intelligence" : "local";
+}
+
+// Standalone: a missing or blank key selects local chat instead of failing startup.
+export function assertApiDeploymentConfig(_config: Config): void {}
+
+// Standalone: CHAT_RETENTION_DAYS is unset (keep forever) or a positive whole number of days.
+export function chatRetentionDays(value = process.env.CHAT_RETENTION_DAYS): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) < 1)
+    throw new Error("CHAT_RETENTION_DAYS must be a positive whole number of days");
+  return Number(trimmed);
 }
 
 /** Accept a full worker URL, or host:port from a platform that omits the scheme. */
@@ -149,7 +160,9 @@ export function readConfig(): Config {
     agentBackend: backend,
     agentUrl: process.env.AGENT_URL,
     agentToken: process.env.AGENT_TOKEN,
-    intelligenceApiKey: required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage),
+    // Standalone: optional; see chatBackend().
+    intelligenceApiKey: process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined,
+    chatRetentionDays: chatRetentionDays(),
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: `${publicUrl}/api/google/callback`,

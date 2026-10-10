@@ -9,18 +9,21 @@ const db = await createStore({
   databaseUrl: config.databaseUrl,
 });
 await db.recoverInterruptedActions();
-const { app, agent } = await createApp(db, config);
+const { app, agent, chat } = await createApp(db, config);
 if (config.taskWorkerEnabled) agent.start();
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () =>
   console.log(`OpenMuse ${config.mode} API ready at ${config.publicUrl}`),
 );
 const shutdown = () => {
-  server.close(() => {
-    void agent
-      .stop()
-      .then(() => db.close())
-      .then(() => process.exit(0));
-  });
+  // Standalone: end local chat streams first, saving in-flight replies, so server.close can finish.
+  void (chat?.close() ?? Promise.resolve()).finally(() =>
+    server.close(() => {
+      void agent
+        .stop()
+        .then(() => db.close())
+        .then(() => process.exit(0));
+    }),
+  );
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

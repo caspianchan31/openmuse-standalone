@@ -141,6 +141,11 @@ export class Store {
   close(): Promise<void> {
     return this.db.close();
   }
+  // Standalone: raw single-statement SQL for the self-hosted chat store
+  // (apps/server/src/standalone/chat-store.ts), which keeps its own chat_* tables.
+  async sql<T = Record<string, unknown>>(text: string, params?: unknown[]): Promise<T[]> {
+    return (await this.db.query(text, params)).rows as unknown as T[];
+  }
   async updateCredential(owner: string, connectionId: string, secret: string): Promise<boolean> {
     const result = await this.db.query(
       "UPDATE records SET data=jsonb_set(data,'{secret}',$3::jsonb),updated_at=now() WHERE owner=$1 AND kind='credentials' AND id='google' AND data->>'connectionId'=$2 RETURNING data",

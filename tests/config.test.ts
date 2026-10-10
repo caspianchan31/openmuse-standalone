@@ -4,6 +4,8 @@ import {
   assertApiDeploymentConfig,
   browserWorkerUrl,
   type Config,
+  chatBackend,
+  chatRetentionDays,
   readConfig,
   shadowedEnvKeys,
 } from "../apps/server/src/config.ts";
@@ -28,19 +30,12 @@ function liveConfig(intelligenceApiKey?: string): Config {
   };
 }
 
-const missingKeyMessage =
-  "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
-  "Run `npx copilotkit@latest login` and `npx copilotkit@latest project select`, " +
-  "then set the generated server-only key. " +
-  "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
-
-test("every API mode rejects a missing or blank Intelligence key", () => {
+// Standalone: a missing or blank key selects local chat instead of failing startup.
+test("every API mode accepts a missing or blank Intelligence key and selects local chat", () => {
   for (const mode of [sampleConfig, liveConfig()]) {
     for (const key of [undefined, "", " \t\n"]) {
-      assert.throws(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }), {
-        name: "Error",
-        message: missingKeyMessage,
-      });
+      assert.doesNotThrow(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }));
+      assert.equal(chatBackend({ ...mode, intelligenceApiKey: key }), "local");
     }
   }
 });
@@ -50,7 +45,37 @@ test("every API mode accepts a non-empty Intelligence key", () => {
     assert.doesNotThrow(() =>
       assertApiDeploymentConfig({ ...mode, intelligenceApiKey: "test-project-key-never-sent" }),
     );
+    // Standalone: a key keeps upstream's Intelligence mode.
+    assert.equal(
+      chatBackend({ ...mode, intelligenceApiKey: "test-project-key-never-sent" }),
+      "intelligence",
+    );
   }
+});
+
+// Standalone: readConfig no longer requires the key, and treats a blank one as unset.
+test("readConfig starts without an Intelligence key and validates chat retention", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.HOST = "127.0.0.1";
+  delete process.env.AGENT_BACKEND;
+  delete process.env.CHAT_RETENTION_DAYS;
+  for (const key of [undefined, "", "  "]) {
+    if (key === undefined) delete process.env.CPK_INTELLIGENCE_API_KEY;
+    else process.env.CPK_INTELLIGENCE_API_KEY = key;
+    const config = readConfig();
+    assert.equal(config.intelligenceApiKey, undefined);
+    assert.equal(chatBackend(config), "local");
+    assert.equal(config.chatRetentionDays, undefined);
+  }
+  process.env.CPK_INTELLIGENCE_API_KEY = " test-project-key-never-sent ";
+  assert.equal(readConfig().intelligenceApiKey, "test-project-key-never-sent");
+  assert.equal(chatRetentionDays("30"), 30);
+  for (const value of ["0", "-1", "1.5", "soon"])
+    assert.throws(() => chatRetentionDays(value), /CHAT_RETENTION_DAYS/);
 });
 
 test("web search is enabled by default with an explicit opt-out", (t) => {

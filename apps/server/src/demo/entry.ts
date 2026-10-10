@@ -3,12 +3,13 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { intelligenceKeyRequiredMessage, required } from "../config.ts";
+import { required } from "../config.ts";
 import { createStore } from "../db.ts";
 import { createDemoModel, demoModel } from "./model.ts";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
-const intelligenceApiKey = required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage);
+// Standalone: the key is optional; without it the demo API keeps chat in its own database.
+const intelligenceApiKey = process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined;
 const jevMode = process.env.DEMO_JEV_MODE ?? "sample";
 if (jevMode !== "sample" && jevMode !== "live")
   throw new Error("DEMO_JEV_MODE must be sample or live");
@@ -96,7 +97,7 @@ const api = spawn(
         process.env.DEMO_ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081",
       DO_NOT_TRACK: "1",
       COPILOTKIT_TELEMETRY_DISABLED: "true",
-      CPK_INTELLIGENCE_API_KEY: intelligenceApiKey,
+      ...(intelligenceApiKey ? { CPK_INTELLIGENCE_API_KEY: intelligenceApiKey } : {}),
     },
   },
 );

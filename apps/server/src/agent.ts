@@ -11,6 +11,7 @@ import type { Config } from "./config.ts";
 import { ConversationAgent } from "./engine/conversation.ts";
 import type { AgentService } from "./engine/service.ts";
 import { createJevAdapter, type JevAdapter } from "./jev/adapter.ts";
+import type { StandaloneChat } from "./standalone/index.ts";
 
 export function agentConfigured(config: Config) {
   return (
@@ -29,7 +30,9 @@ export function makeRuntime(
   config: Config,
   service: AgentService,
   auth: Auth,
-  intelligence: CopilotKitIntelligence,
+  // Standalone: without an Intelligence key, `chat` supplies the local runner and hooks.
+  intelligence: CopilotKitIntelligence | undefined,
+  chat?: Pick<StandaloneChat, "runner" | "hooks">,
 ) {
   // Built on first use, then shared so live mode reuses one TypeSafe client across requests.
   let jevAdapter: JevAdapter | undefined;
@@ -55,6 +58,16 @@ export function makeRuntime(
               sharedJevAdapter(),
             ),
   });
+  // Standalone: local mode runs the runtime in SSE mode on this server's own runner.
+  if (!intelligence) {
+    if (!chat) throw new Error("Local chat mode requires the standalone runner");
+    const runtime = new CopilotRuntime({
+      agents,
+      runner: chat.runner,
+      telemetryProperties: { accessibility_title: "OpenMuse" },
+    });
+    return createCopilotHonoHandler({ runtime, basePath: "/api/copilotkit", hooks: chat.hooks });
+  }
   const runtime = new CopilotRuntime({
     agents,
     intelligence,

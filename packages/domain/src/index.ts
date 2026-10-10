@@ -195,6 +195,8 @@ export interface Workspace {
     configured: boolean;
     openbotConfigured: boolean;
     richThreads?: boolean;
+    /** Standalone: where conversations are stored; "local" is this server's own database. */
+    threads?: "intelligence" | "local";
   };
 }
 
