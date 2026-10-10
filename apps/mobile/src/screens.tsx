@@ -1363,7 +1363,14 @@ export function ConnectionsScreen({ query = "" }: { query?: string }) {
               />
               <SettingsLine
                 label="Rich Threads"
-                value={w.runtime.richThreads ? "CopilotKit Intelligence" : "Not connected"}
+                value={
+                  // Standalone: without an Intelligence key, conversations stay on this server.
+                  w.runtime.richThreads
+                    ? w.runtime.threads === "local"
+                      ? "This server"
+                      : "CopilotKit Intelligence"
+                    : "Not connected"
+                }
               />
               <Button
                 small
