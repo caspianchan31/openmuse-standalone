@@ -4,6 +4,7 @@ import type { Hono } from "hono";
 import type { Auth } from "../auth.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
+import { AppError } from "../errors.ts";
 import { ChatStore } from "./chat-store.ts";
 import { LocalAgentRunner } from "./runner.ts";
 import { standaloneRuntimeHooks } from "./runtime-hooks.ts";
@@ -37,8 +38,8 @@ export async function createStandaloneChat(input: {
     hooks: standaloneRuntimeHooks({ auth: input.auth, threads: store, runs: runner }),
     routes: standaloneThreadRoutes(store),
     async ensureThread(owner, threadId, agentId) {
-      void [owner, threadId, agentId];
-      throw new Error("Standalone chat: ensureThread is not implemented yet");
+      if ((await store.ensureThread(owner, threadId, agentId)) === "forbidden")
+        throw new AppError("Thread not found", 404);
     },
     close: () => runner.close(),
   };

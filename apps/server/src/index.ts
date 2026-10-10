@@ -16,14 +16,16 @@ const server = serve({ fetch: app.fetch, port: config.port, hostname: config.hos
 );
 const shutdown = () => {
   // Standalone: end local chat streams first, saving in-flight replies, so server.close can finish.
-  void (chat?.close() ?? Promise.resolve()).finally(() =>
-    server.close(() => {
-      void agent
-        .stop()
-        .then(() => db.close())
-        .then(() => process.exit(0));
-    }),
-  );
+  void Promise.resolve(chat?.close())
+    .catch(() => console.error("[OpenMuse] Local chat did not close cleanly"))
+    .then(() =>
+      server.close(() => {
+        void agent
+          .stop()
+          .then(() => db.close())
+          .then(() => process.exit(0));
+      }),
+    );
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
