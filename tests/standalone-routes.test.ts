@@ -17,7 +17,9 @@ import {
 import { Hono } from "hono";
 import { from, type Observable, of } from "rxjs";
 import { AppError } from "../apps/server/src/errors.ts";
+import { CursorError } from "../apps/server/src/standalone/chat-store.ts";
 import {
+  chatUnavailableMessage,
   localThreadEndpoints,
   standaloneRuntimeHooks,
   threadLockedMessage,
@@ -53,10 +55,6 @@ interface Row {
   lastRunAt: string | null;
   runId: string | null;
   events: BaseEvent[];
-}
-
-class CursorError extends Error {
-  override name = "CursorError";
 }
 
 class MemoryThreads implements StandaloneThreadStore {
@@ -125,7 +123,7 @@ class MemoryThreads implements StandaloneThreadStore {
     let offset = 0;
     if (query.cursor !== undefined) {
       offset = Number(Buffer.from(query.cursor, "base64url").toString());
-      if (!Number.isInteger(offset) || offset < 0) throw new CursorError("Invalid cursor");
+      if (!Number.isInteger(offset) || offset < 0) throw new CursorError();
     }
     const limit = query.limit ?? 50;
     const matching = [...this.rows.values()]
@@ -458,6 +456,50 @@ test("another owner's thread is 404 on run, connect and stop, and no lock is tak
       undefined,
     );
   }
+});
+
+test("a database failure while claiming or checking the owner is a 503 JSON, not a stream", async (t) => {
+  const logged = t.mock.method(console, "error", () => {});
+  const { threads, runner, hooks } = fixture();
+  threads.add("alice", "alice-thread");
+  const failure = Object.assign(new Error("connection refused for postgres://secret"), {
+    code: "ECONNREFUSED",
+  });
+  t.mock.method(runner, "claim", async () => {
+    throw failure;
+  });
+  t.mock.method(threads, "threadOwner", async () => {
+    throw failure;
+  });
+  for (const [path, route, body] of [
+    [
+      "/api/copilotkit/agent/default/run",
+      { method: "agent/run", agentId: "default" },
+      runBody("alice-thread", "run-1"),
+    ],
+    [
+      "/api/copilotkit/agent/default/connect",
+      { method: "agent/connect", agentId: "default" },
+      runBody("alice-thread", "connect-1"),
+    ],
+    [
+      "/api/copilotkit/agent/default/stop/alice-thread",
+      { method: "agent/stop", agentId: "default", threadId: "alice-thread" },
+      undefined,
+    ],
+  ] as const) {
+    const response = await thrown(
+      hooks.onBeforeHandler(handlerContext(request(path, { owner: "alice", body }), route)),
+    );
+    assert.equal(response.status, 503, path);
+    assert.match(response.headers.get("content-type") ?? "", /^application\/json/);
+    assert.deepEqual(await response.json(), { error: chatUnavailableMessage });
+  }
+  assert.equal(threads.rows.get("alice-thread")?.runId, null);
+  assert.equal(
+    logged.mock.calls.some((call) => String(call.arguments[0]).includes("secret")),
+    false,
+  );
 });
 
 test("hooks reject a request without a valid session and hide the shared debug stream", async () => {

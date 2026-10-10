@@ -62,7 +62,8 @@ export function withRunIdentity(event: BaseEvent, threadId: string, runId: strin
 
 /**
  * The persisted form of one run: compacted, RUN_STARTED first with input reduced to
- * { threadId, runId, messages } (only messages new to the thread).
+ * { threadId, runId, messages (only those new to the thread), tools: [], context: [] }, and every
+ * RUN_FINISHED carrying the run's threadId and runId.
  */
 export function persistedRunEvents(
   events: BaseEvent[],

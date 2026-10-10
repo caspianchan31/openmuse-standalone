@@ -55,6 +55,7 @@ Without a key, `createApp` builds the standalone chat layer in `apps/server/src/
   - **connect** and **stop**: another owner's thread answers `404`.
   - **info**: `threadEndpoints` is rewritten to `{ list, inspect, mutations: true, realtimeMetadata: false }`, so the app uses the local thread routes and opens no realtime socket.
   - The runtime's debug event stream (`cpk-debug-events`) answers `404`, because it would carry every owner's events.
+  - If the database fails during these checks, the request answers `503 {"error": "Chat history is unavailable right now. Try again."}` before any SSE byte, and nothing is claimed.
 - `GET /api/main-thread` records the owner's main thread in the local database instead of calling Intelligence.
 
 Hono routes serve the thread menu before the runtime handler, behind the normal session check:
@@ -81,7 +82,7 @@ Invalid input is `400`; a missing thread, another owner's thread or a different 
 | `chat_runs` | One row per reply: thread, order, status (`running`, `finished`, `error`, `stopped`, `interrupted`) and, once closed, its compacted AG-UI events and message ids |
 | `chat_events` | A journal of the events of replies that are still running, so a crash loses nothing that was streamed |
 
-Each saved run starts with `RUN_STARTED` carrying only the messages that were new to the thread. Tools, context and forwarded properties sent by the app are not stored.
+Each saved run starts with `RUN_STARTED` carrying only the messages that were new to the thread. Tools, context, state and forwarded properties sent by the app are not stored (tools and context are saved as empty lists, which the client requires on replay). Every saved `RUN_FINISHED` carries its thread and run ids.
 
 ## Durability and recovery
 
@@ -104,5 +105,6 @@ The default deployment is still a single-owner workspace protected by one access
 
 - `tests/standalone-routes.test.ts`: runtime hooks and thread routes against in-memory stores, and the hooks inside the real CopilotKit runtime handler.
 - `tests/standalone-api.test.ts`: keyless `createApp` through the real runtime HTTP path with the sample agent: no Intelligence calls, main thread, SSE runs, listing, messages, replay, 409 before SSE, owner isolation, claim release, pagination and mutations.
+- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), and a send on a busy thread surfacing as the thread lock the app holds.
 - `tests/standalone-runner.test.ts` and `tests/standalone-chat-store.test.ts`: persistence, replay after restart, durability boundary, concurrency, stop, crash recovery and retention.
 - `tests/rich-threads.test.ts` keeps covering Intelligence mode unchanged.

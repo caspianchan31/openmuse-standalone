@@ -4,6 +4,7 @@ import type { BaseEvent } from "@ag-ui/client";
 import { Hono } from "hono";
 import { z } from "zod";
 import { AppError } from "../errors.ts";
+import { CursorError } from "./chat-store.ts";
 import { messagesFromEvents, stateFromEvents, toWireMessages } from "./events.ts";
 import { threadLockedMessage } from "./runtime-hooks.ts";
 import { type StandaloneThreadStore, threadLockedCode, type WireMessage } from "./types.ts";
@@ -75,8 +76,7 @@ export function standaloneThreadRoutes(
         }),
       );
     } catch (error) {
-      if (error instanceof Error && error.name === "CursorError")
-        throw new AppError("Invalid cursor", 400);
+      if (error instanceof CursorError) throw new AppError("Invalid cursor", 400);
       throw error;
     }
   });

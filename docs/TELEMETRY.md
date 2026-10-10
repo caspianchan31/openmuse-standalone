@@ -16,7 +16,7 @@ Keep both generated values in the server environment:
 
 | Variable | Purpose |
 | --- | --- |
-| `CPK_INTELLIGENCE_API_KEY` | Server-only project key for Rich Threads. |
+| `CPK_INTELLIGENCE_API_KEY` | Optional server-only project key that stores Rich Threads in Intelligence. Without it, conversations stay in the API's own database ([local mode](STANDALONE-THREADS.md)). |
 | `CPK_TELEMETRY_ID` | CLI-issued project binding that the telemetry sink can resolve to an Intelligence account. |
 
 Deploy the values for the selected project together. Do not generate your own

@@ -62,13 +62,11 @@ From the repository root:
 
 ```sh
 pnpm install --frozen-lockfile
-npx copilotkit@latest login
-npx copilotkit@latest project select
 pnpm --dir apps/worker exec playwright install chromium
 pnpm dev:demo
 ```
 
-This starts AI Mock, the normal OpenMuse API on port **8788**, and a separate real browser worker on **8791**. Demo files and profiles stay in ignored `artifacts/demo/`. The runner reads only the Intelligence key from the project's private `.env` and passes it to its isolated API process; it does not pass provider or Google credentials. The Linux computer is disabled for this focused browser recording.
+This starts AI Mock, the normal OpenMuse API on port **8788**, and a separate real browser worker on **8791**. Demo files and profiles stay in ignored `artifacts/demo/`. Without an Intelligence key, the demo API stores its conversations in its own isolated database ([local mode](STANDALONE-THREADS.md)). To record against Intelligence instead, run `npx copilotkit@latest login` and `npx copilotkit@latest project select` first and set `CPK_INTELLIGENCE_API_KEY`; the runner passes only that key to its isolated API process. It does not pass provider or Google credentials. The Linux computer is disabled for this focused browser recording.
 
 Start the app in another terminal:
 

@@ -44,6 +44,8 @@ services:
         generateValue: true
       - key: OPENAI_API_KEY
         sync: false
+      # Optional: leave blank to keep conversations in the API's own database on the
+      # disk above (docs/STANDALONE-THREADS.md); set it to store them in Intelligence.
       - key: CPK_INTELLIGENCE_API_KEY
         sync: false
       # Use the CLI-issued identity for the same Intelligence project as the key.

@@ -31,11 +31,20 @@ export const localThreadEndpoints = {
 export const threadLockedMessage =
   "This conversation is still replying. Try again when it finishes.";
 
+/** Body of the 503 a request receives when the chat database fails during the hook's checks. */
+export const chatUnavailableMessage = "Chat history is unavailable right now. Try again.";
+
 /** Thread and run ids longer than this are left to the runtime's own validation. */
 const maxIdLength = 256;
 
+// `new Response`, not `Response.json`: @hono/node-server replaces the global Response class, and the
+// runtime recognises a thrown answer with `instanceof Response`, which a static Response.json()
+// result (built by the original class) fails, turning the 409 into a 500.
 const jsonError = (status: number, error: string, code?: string) =>
-  Response.json(code ? { error, code } : { error }, { status });
+  new Response(JSON.stringify(code ? { error, code } : { error }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 const threadNotFound = () => jsonError(404, "Thread not found");
 
 const isId = (value: unknown): value is string =>
@@ -59,6 +68,7 @@ async function peekBody(request: Request): Promise<Record<string, unknown> | und
  * answers non-200. agent/connect and agent/stop: another owner's thread -> 404.
  * info: threadEndpoints rewritten to localThreadEndpoints.
  * cpk-debug-events: 404, because the debug bus carries every owner's run events.
+ * A database failure during these checks: 503 JSON, before any SSE byte.
  */
 export function standaloneRuntimeHooks({
   auth,
@@ -84,35 +94,45 @@ export function standaloneRuntimeHooks({
 
   return {
     async onBeforeHandler({ request, route }) {
-      switch (route.method) {
-        case "agent/run": {
-          const owner = await ownerOf(request);
-          const body = await peekBody(request);
-          // An invalid body is answered 400 by the runtime; nothing is claimed.
-          if (!isId(body?.threadId) || !isId(body?.runId)) return;
-          const { threadId, runId } = body;
-          const claim = await runs.claim({ owner, threadId, agentId: route.agentId, runId });
-          if (!claim.ok)
-            throw claim.reason === "locked"
-              ? jsonError(409, threadLockedMessage, threadLockedCode)
-              : threadNotFound();
-          claims.set(request, { threadId, runId });
-          return;
+      try {
+        switch (route.method) {
+          case "agent/run": {
+            const owner = await ownerOf(request);
+            const body = await peekBody(request);
+            // An invalid body is answered 400 by the runtime; nothing is claimed.
+            if (!isId(body?.threadId) || !isId(body?.runId)) return;
+            const { threadId, runId } = body;
+            const claim = await runs.claim({ owner, threadId, agentId: route.agentId, runId });
+            if (!claim.ok)
+              throw claim.reason === "locked"
+                ? jsonError(409, threadLockedMessage, threadLockedCode)
+                : threadNotFound();
+            claims.set(request, { threadId, runId });
+            return;
+          }
+          case "agent/connect": {
+            const body = await peekBody(request);
+            // Threads are only ever created with ids that pass isId, so other ids replay nothing.
+            if (isId(body?.threadId)) await assertOwnThread(request, body.threadId);
+            else await ownerOf(request);
+            return;
+          }
+          case "agent/stop":
+            await assertOwnThread(request, route.threadId);
+            return;
+          case "cpk-debug-events":
+            throw jsonError(404, "Not found");
+          default:
+            return;
         }
-        case "agent/connect": {
-          const body = await peekBody(request);
-          // Threads are only ever created with ids that pass isId, so other ids replay nothing.
-          if (isId(body?.threadId)) await assertOwnThread(request, body.threadId);
-          else await ownerOf(request);
-          return;
-        }
-        case "agent/stop":
-          await assertOwnThread(request, route.threadId);
-          return;
-        case "cpk-debug-events":
-          throw jsonError(404, "Not found");
-        default:
-          return;
+      } catch (error) {
+        if (error instanceof Response) throw error;
+        // The database failed while checking the owner or claiming the thread: a JSON 503 before
+        // any SSE byte, without the error's details. Nothing is claimed (a claim is one statement).
+        console.error(
+          `[OpenMuse] Local chat check failed: ${error instanceof Error ? error.name : "Error"}`,
+        );
+        throw jsonError(503, chatUnavailableMessage);
       }
     },
     async onResponse({ request, response, route }) {
