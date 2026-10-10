@@ -10,8 +10,31 @@ export const threadLocked = "agent_thread_locked";
 export function isThreadLocked(event: Pick<RunError, "error" | "code">) {
   return (
     event.code === threadLocked ||
-    (event.error instanceof Error && event.error.name === "AgentThreadLockedError")
+    (event.error instanceof Error && event.error.name === "AgentThreadLockedError") ||
+    // Standalone: without Intelligence the runtime streams over SSE, so a lock arrives as HTTP.
+    isHttpThreadLock(event.error)
   );
+}
+
+/**
+ * Standalone: a server without an Intelligence key refuses a busy thread with HTTP 409
+ * `{ error, code: "agent_thread_locked" }` before streaming. HttpAgent turns that into an Error
+ * with `status`, the parsed `payload` and the message `HTTP 409: <body>`, and CopilotKit reports
+ * it as agent_run_failed. A lock found after the stream began is a RUN_ERROR event whose code
+ * CopilotKit copies onto the error.
+ */
+function isHttpThreadLock(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const { status, payload, code } = error as Error & {
+    status?: unknown;
+    payload?: unknown;
+    code?: unknown;
+  };
+  if (code === threadLocked) return true;
+  if (status === 409 && typeof payload === "object" && payload !== null)
+    return (payload as { code?: unknown }).code === threadLocked;
+  // The body was not parsed as JSON (for example a proxy changed its content type).
+  return error.message.startsWith("HTTP 409:") && error.message.includes(threadLocked);
 }
 
 /** A failed turn, carrying the CopilotKit error code that reported it. */
