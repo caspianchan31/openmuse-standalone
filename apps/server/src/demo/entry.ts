@@ -106,6 +106,12 @@ console.log(
 );
 console.log(`Demo API: ${publicUrl}; browser worker: ${workerUrl}`);
 console.log(`Isolated demo data: ${dataDir}`);
+// Standalone: say where the demo's conversations are stored.
+console.log(
+  intelligenceApiKey
+    ? "Chat threads: CopilotKit Intelligence"
+    : "Chat threads: the demo API's own database (no CopilotKit Intelligence key set)",
+);
 console.log(`Start the app with EXPO_PUBLIC_API_URL=${publicUrl} pnpm dev:web`);
 console.log(
   "The demo's public local session token is documented in apps/server/src/demo/entry.ts.",

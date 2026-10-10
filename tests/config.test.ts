@@ -73,9 +73,17 @@ test("readConfig starts without an Intelligence key and validates chat retention
   }
   process.env.CPK_INTELLIGENCE_API_KEY = " test-project-key-never-sent ";
   assert.equal(readConfig().intelligenceApiKey, "test-project-key-never-sent");
+  assert.equal(chatBackend(readConfig()), "intelligence");
   assert.equal(chatRetentionDays("30"), 30);
-  for (const value of ["0", "-1", "1.5", "soon"])
+  assert.equal(chatRetentionDays(" 7 "), 7);
+  assert.equal(chatRetentionDays("  "), undefined);
+  for (const value of ["0", "-1", "1.5", "soon", "1e3"])
     assert.throws(() => chatRetentionDays(value), /CHAT_RETENTION_DAYS/);
+  delete process.env.CPK_INTELLIGENCE_API_KEY;
+  process.env.CHAT_RETENTION_DAYS = "90";
+  assert.equal(readConfig().chatRetentionDays, 90);
+  process.env.CHAT_RETENTION_DAYS = "0";
+  assert.throws(() => readConfig(), /CHAT_RETENTION_DAYS/);
 });
 
 test("web search is enabled by default with an explicit opt-out", (t) => {
