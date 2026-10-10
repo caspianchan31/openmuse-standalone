@@ -349,6 +349,9 @@ export function ChatScreen({
           agentId,
           () => copilotkit.runAgent({ agent }),
           (onError) => copilotkit.subscribe({ onError }),
+          [],
+          // Standalone: a queued message refused by a thread lock is held below, not reported.
+          message ? agent : undefined,
         );
         await Promise.all([refresh(), refreshAgent()]);
       } catch (e) {

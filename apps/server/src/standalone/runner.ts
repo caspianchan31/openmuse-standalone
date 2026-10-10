@@ -7,7 +7,6 @@ import { randomUUID } from "node:crypto";
 import {
   type AbstractAgent,
   type BaseEvent,
-  compactEvents,
   EventType,
   type Message,
   type RunStartedEvent,
@@ -24,6 +23,8 @@ import { type Observable, ReplaySubject } from "rxjs";
 import { backgroundFailure } from "../log.ts";
 import type { BeginResult, ChatStore, DeadLocks, RunStatus } from "./chat-store.ts";
 import {
+  compactLeniently,
+  compactRun,
   messageIdsOf,
   persistedRunEvents,
   replayedRun,
@@ -210,21 +211,24 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
   /** Remembers a claim until its run begins, so a connect in between waits for the run. */
   private trackClaim(threadId: string, runId: string) {
     let resolve = () => {};
+    // A claim whose run never begins and is never released (its request failed in between) is
+    // forgotten once its lock would be stale.
+    let expiry: ReturnType<typeof setTimeout> | undefined;
     const entry: PendingClaim = {
       runId,
       begun: new Promise<void>((done) => {
         resolve = done;
       }),
       settle: () => {
+        clearTimeout(expiry);
         if (this.claimed.get(threadId) === entry) this.claimed.delete(threadId);
         resolve();
       },
     };
     this.claimed.get(threadId)?.settle();
     this.claimed.set(threadId, entry);
-    // A claim whose run never begins and is never released (its request failed in between) is
-    // forgotten once its lock would be stale.
-    setTimeout(entry.settle, this.staleAfterMs).unref();
+    expiry = setTimeout(entry.settle, this.staleAfterMs);
+    expiry.unref();
   }
 
   private settleClaim(threadId: string, runId: string) {
@@ -365,7 +369,13 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
       await this.store.releaseClaim(threadId, runId).catch(() => undefined);
       return refuse(runError(startFailedMessage));
     }
-    if (result.status === "locked") return refuse(runError(lockedMessage, threadLockedCode));
+    if (result.status === "locked") {
+      // The thread is claimed for this very runId, which runs on another thread: undo this
+      // request's claim (a lock held by another run stays).
+      if (result.holder === runId)
+        await this.store.releaseClaim(threadId, runId).catch(() => undefined);
+      return refuse(runError(lockedMessage, threadLockedCode));
+    }
     if (result.status === "missing") return refuse(runError("This conversation was not found."));
     if (result.status === "duplicate") {
       await this.store.releaseClaim(threadId, runId).catch(() => undefined);
@@ -489,48 +499,59 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
    * ends the stream. If the save keeps failing, the stream ends with persistence_failed and the
    * lock is left to go stale, so a sweep closes the run from its journal. If another process had
    * already recovered the run from its journal (its lock went stale), the stored reply is that
-   * shorter one, so the stream ends with persistence_failed too.
+   * shorter one, so the stream ends with persistence_failed too. Any other failure here ends the
+   * same way: the run always leaves `active`, so its lock is no longer heartbeated and a sweep
+   * recovers it from its journal once it is stale.
    */
   private async finalize(run: ActiveRun, interruption?: string): Promise<void> {
     if (run.finalized) return;
     run.finalized = true;
     if (run.flushTimer) clearTimeout(run.flushTimer);
     run.flushTimer = undefined;
-    await run.flushChain;
-    const message = run.closing ? restartingMessage : interruption;
-    const appended = finalizeRunEvents(run.events, {
-      stopRequested: run.stopRequested,
-      ...(message !== undefined ? { interruptionMessage: message } : {}),
-    }).map((event) => withRunIdentity(event, run.threadId, run.runId));
-    // finalizeRunEvents appended to run.events in place; keep the identity-filled copies.
-    run.events.splice(run.events.length - appended.length, appended.length, ...appended);
-    const status: Exclude<RunStatus, "running"> = run.closing
-      ? "interrupted"
-      : run.stopRequested
-        ? "stopped"
-        : run.events.find(isTerminal)?.type === EventType.RUN_ERROR
-          ? "error"
-          : "finished";
-    const events = persistedRunEvents(run.events, run);
-    const saved = await this.closeWithRetry({
-      threadId: run.threadId,
-      runId: run.runId,
-      status,
-      events,
-      messageIds: messageIdsOf(events),
-    });
-    if (saved) {
-      for (const event of [...run.held, ...appended]) run.subject.next(event);
-    } else {
-      // Keep the journal complete for the sweep that will recover this run.
-      run.pending.push(...appended);
-      await this.flush(run);
-      for (const event of appended) if (!isTerminal(event)) run.subject.next(event);
-      run.subject.next(runError(persistenceFailedMessage, persistenceFailedCode));
+    let appended: BaseEvent[] = [];
+    let saved = false;
+    try {
+      await run.flushChain;
+      const message = run.closing ? restartingMessage : interruption;
+      appended = finalizeRunEvents(run.events, {
+        stopRequested: run.stopRequested,
+        ...(message !== undefined ? { interruptionMessage: message } : {}),
+      }).map((event) => withRunIdentity(event, run.threadId, run.runId));
+      // finalizeRunEvents appended to run.events in place; keep the identity-filled copies.
+      run.events.splice(run.events.length - appended.length, appended.length, ...appended);
+      const status: Exclude<RunStatus, "running"> = run.closing
+        ? "interrupted"
+        : run.stopRequested
+          ? "stopped"
+          : run.events.find(isTerminal)?.type === EventType.RUN_ERROR
+            ? "error"
+            : "finished";
+      const events = persistedRunEvents(run.events, run);
+      saved = await this.closeWithRetry({
+        threadId: run.threadId,
+        runId: run.runId,
+        status,
+        events,
+        messageIds: messageIdsOf(events),
+      });
+    } catch (error) {
+      backgroundFailure("standalone chat finalize", error);
     }
-    run.subject.complete();
-    if (this.active.get(run.threadId) === run) this.active.delete(run.threadId);
-    run.markDone();
+    try {
+      if (saved) {
+        for (const event of [...run.held, ...appended]) run.subject.next(event);
+      } else {
+        // Keep the journal complete for the sweep that will recover this run.
+        run.pending.push(...appended);
+        await this.flush(run);
+        for (const event of appended) if (!isTerminal(event)) run.subject.next(event);
+        run.subject.next(runError(persistenceFailedMessage, persistenceFailedCode));
+      }
+    } finally {
+      run.subject.complete();
+      if (this.active.get(run.threadId) === run) this.active.delete(run.threadId);
+      run.markDone();
+    }
   }
 
   /** True once this run's events are saved; false when they were not (failed, or closed elsewhere). */
@@ -558,7 +579,7 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     // ReplaySubject replays it from the start, so nothing is lost or sent twice.
     const captured = this.active.get(threadId);
     const runs = await this.store.closedRunEvents(threadId, captured?.runId);
-    for (const event of compactEvents(runs.flatMap(replayedRun))) subject.next(event);
+    for (const event of compactLeniently(runs.flatMap(replayedRun))) subject.next(event);
     // A run that began after the capture is tailed too, unless the history read already saw it.
     const live = captured ?? this.active.get(threadId);
     const stored = (run: ActiveRun) =>
@@ -573,7 +594,7 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     }
     // A run held by another process: send what its journal holds (no cross-process live tail).
     const journal = live ? null : await this.store.runningJournal(threadId);
-    if (journal) for (const event of compactEvents(journal)) subject.next(event);
+    if (journal) for (const event of compactRun(journal)) subject.next(event);
     subject.complete();
   }
 

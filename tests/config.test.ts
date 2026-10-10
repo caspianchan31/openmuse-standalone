@@ -84,6 +84,9 @@ test("readConfig starts without an Intelligence key and validates chat retention
   assert.equal(readConfig().chatRetentionDays, 90);
   process.env.CHAT_RETENTION_DAYS = "0";
   assert.throws(() => readConfig(), /CHAT_RETENTION_DAYS/);
+  // Intelligence mode ignores it, so an invalid value does not stop that API from starting.
+  process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+  assert.equal(readConfig().chatRetentionDays, undefined);
 });
 
 test("web search is enabled by default with an explicit opt-out", (t) => {

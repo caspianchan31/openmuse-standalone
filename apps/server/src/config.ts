@@ -144,6 +144,8 @@ export function readConfig(): Config {
   }
   const port = Number(process.env.PORT ?? 8787);
   const publicUrl = process.env.PUBLIC_API_URL ?? `http://localhost:${port}`;
+  // Standalone: optional; see chatBackend(). Retention applies to local chat only.
+  const intelligenceApiKey = process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined;
   const config: Config = {
     mode,
     port,
@@ -160,9 +162,8 @@ export function readConfig(): Config {
     agentBackend: backend,
     agentUrl: process.env.AGENT_URL,
     agentToken: process.env.AGENT_TOKEN,
-    // Standalone: optional; see chatBackend().
-    intelligenceApiKey: process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined,
-    chatRetentionDays: chatRetentionDays(),
+    intelligenceApiKey,
+    chatRetentionDays: intelligenceApiKey ? undefined : chatRetentionDays(),
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: `${publicUrl}/api/google/callback`,

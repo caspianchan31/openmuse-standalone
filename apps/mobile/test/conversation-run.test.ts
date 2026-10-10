@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   ConversationTurnError,
+  claimThreadLock,
   isThreadLocked,
+  type LockableAgent,
   replayedRunError,
   runConversationTurn,
   showsRunError,
@@ -188,4 +190,90 @@ test("a queued turn refused by the SSE 409 is held silently; anything else shows
     ),
     false,
   );
+});
+
+type LockSubscriber = Parameters<LockableAgent["subscribe"]>[0];
+type Claim = { stopPropagation: true } | undefined;
+
+/** An agent that, like @ag-ui/client, offers each failure to its subscribers in order. */
+function lockableAgent() {
+  const subscribers = new Set<LockSubscriber>();
+  return {
+    subscribe: (subscriber: LockSubscriber) => {
+      subscribers.add(subscriber);
+      return { unsubscribe: () => subscribers.delete(subscriber) };
+    },
+    /** The first stopPropagation, as AbstractAgent.onError takes it (no log, no rethrow). */
+    fail: (error: Error) =>
+      [...subscribers].map((s) => s.onRunFailed?.({ error }) as Claim).find(Boolean),
+    runError: (event: { code?: string; message?: string }) =>
+      [...subscribers].map((s) => s.onRunErrorEvent?.({ event }) as Claim).find(Boolean),
+    subscribers,
+  };
+}
+
+test("claimThreadLock claims only lock refusals, which stops their propagation", () => {
+  const agent = lockableAgent();
+  const lock = claimThreadLock(agent);
+  assert.equal(agent.fail(httpError(500, { error: "Boom" })), undefined);
+  assert.equal(agent.runError({ code: "model_error", message: "Boom" }), undefined);
+  assert.equal(lock.refusal(), undefined);
+  // The local 409, Intelligence's AgentThreadLockedError, and a RUN_ERROR with the lock code.
+  const refused = httpError(409, lockBody);
+  assert.deepEqual(agent.fail(refused), { stopPropagation: true });
+  assert.equal(lock.refusal(), refused);
+  assert.deepEqual(agent.fail(new AgentThreadLockedError("t-1")), { stopPropagation: true });
+  assert.equal(lock.refusal(), refused, "the first refusal is kept");
+  lock.unsubscribe();
+  assert.equal(agent.subscribers.size, 0);
+
+  const streamed = claimThreadLock(agent);
+  assert.deepEqual(agent.runError({ code: threadLocked, message: "Busy" }), {
+    stopPropagation: true,
+  });
+  const error = streamed.refusal();
+  assert.equal(error?.message, "Busy");
+  assert.equal(isThreadLocked({ error }), true);
+  streamed.unsubscribe();
+});
+
+test("a turn holding on lock rethrows a claimed refusal as threadLocked and unsubscribes", async () => {
+  const agent = lockableAgent();
+  const bus = reporter([]);
+  await assert.rejects(
+    runConversationTurn(
+      "openmuse-t-1",
+      async () => {
+        // A claimed refusal reaches no CopilotKit onError listener, and the run resolves.
+        assert.deepEqual(agent.fail(new AgentThreadLockedError("t-1")), { stopPropagation: true });
+      },
+      bus.subscribe,
+      [],
+      agent,
+    ),
+    (e: unknown) =>
+      e instanceof ConversationTurnError &&
+      e.code === threadLocked &&
+      e.name === "AgentThreadLockedError",
+  );
+  assert.equal(agent.subscribers.size, 0);
+  assert.equal(bus.listeners.size, 0);
+  // Other failures still reach onError and fail the turn with their own code.
+  const failing = reporter([
+    { code: "agent_run_failed", error: httpError(500, { error: "Boom" }) },
+  ]);
+  await assert.rejects(
+    runConversationTurn(
+      "openmuse-t-1",
+      async () => {
+        assert.equal(agent.fail(httpError(500, { error: "Boom" })), undefined);
+        await failing.execute();
+      },
+      failing.subscribe,
+      [],
+      agent,
+    ),
+    (e: unknown) => e instanceof ConversationTurnError && e.code === "agent_run_failed",
+  );
+  assert.equal(agent.subscribers.size, 0);
 });

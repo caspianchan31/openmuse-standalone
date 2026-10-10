@@ -10,7 +10,11 @@ import {
 import { Observable } from "rxjs";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { ChatStore } from "../apps/server/src/standalone/chat-store.ts";
-import { messagesFromEvents, toWireMessages } from "../apps/server/src/standalone/events.ts";
+import {
+  messagesFromEvents,
+  stateFromEvents,
+  toWireMessages,
+} from "../apps/server/src/standalone/events.ts";
 import { createStandaloneChat } from "../apps/server/src/standalone/index.ts";
 import {
   LocalAgentRunner,
@@ -697,6 +701,9 @@ test("close() saves in-flight runs as interrupted, ends their streams, and is id
   const after = await collect(runner.run(request(replyAgent("a2", ["x"]), "t-close", "close-2")))
     .finished;
   assert.deepEqual(types(after), [EventType.RUN_ERROR]);
+  assert.equal(field(after[0], "message"), "The server is restarting.");
+  // Refused before it began: nothing was stored for it.
+  assert.equal(await runRow("close-2"), undefined);
   assert.equal(await chats.isLocked("t-close"), false);
   pause.open();
 });
@@ -1016,4 +1023,256 @@ test("a connect between the claim and the run's start waits for the run and tail
   await runner.release("t-window", "win-2");
   const replayed = await idle.finished;
   assert.equal(replayed.filter((event) => event.type === EventType.RUN_STARTED).length, 1);
+});
+
+/** An agent whose run sends these STATE_DELTA patches, optionally pausing before it finishes. */
+function patchAgent(patches: unknown[][], pause?: Promise<void>) {
+  return new FakeAgent((input) => [
+    started(input),
+    ...patches.map((delta): Step => ({ event: { type: EventType.STATE_DELTA, delta } })),
+    ...(pause ? [{ gate: pause }] : []),
+    finished(input),
+  ]);
+}
+
+/** request() with the state the client sent, which the runtime also sets on the agent. */
+function requestWithState(
+  agent: AbstractAgent,
+  threadId: string,
+  runId: string,
+  state: Record<string, unknown>,
+) {
+  const run = request(agent, threadId, runId, [user(`${runId}-q`, "Count")]);
+  run.input.state = state;
+  agent.setState(state);
+  return run;
+}
+
+// Valid against the state the run began with, not against {} (compactEvents' starting state).
+const replaceCount = [{ op: "replace", path: "/count", value: 2 }];
+// Valid against no state at all; the agent and the client warn and skip it.
+const replaceMissing = [{ op: "replace", path: "/missing", value: 1 }];
+
+test("a run whose state patches compaction cannot replay from {} finishes and frees its thread", async (t) => {
+  t.mock.method(console, "warn", () => {}); // the agent warns about the patch it cannot apply
+  await chats.ensureThread("alice", "t-patch", "default");
+  const runner = make();
+  const first = await within(
+    collect(
+      runner.run(
+        requestWithState(patchAgent([replaceCount]), "t-patch", "patch-1", {
+          count: 1,
+          kept: true,
+        }),
+      ),
+    ).finished,
+    "the first run to end",
+  );
+  assert.deepEqual(types(first), [
+    EventType.RUN_STARTED,
+    EventType.STATE_DELTA,
+    EventType.RUN_FINISHED,
+  ]);
+  const row = await runRow("patch-1");
+  assert.equal(row?.status, "finished");
+  // The stored snapshot is the state the run ended with, keys it did not touch included.
+  assert.deepEqual(stateFromEvents(row?.events ?? []), { count: 2, kept: true });
+  assert.equal(await runner.isRunning({ threadId: "t-patch" }), false);
+  assert.equal(await chats.isLocked("t-patch"), false);
+
+  // A patch that applies to nothing is dropped; the patches around it are kept.
+  const second = await within(
+    collect(
+      runner.run(
+        requestWithState(
+          patchAgent([replaceMissing, [{ op: "add", path: "/added", value: true }]]),
+          "t-patch",
+          "patch-2",
+          { count: 2, kept: true },
+        ),
+      ),
+    ).finished,
+    "the second run to end",
+  );
+  assert.equal(second.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal((await runRow("patch-2"))?.status, "finished");
+  const replay = await within(collect(runner.connect({ threadId: "t-patch" })).finished, "replay");
+  assert.equal(replay.filter((event) => event.type === EventType.RUN_STARTED).length, 2);
+  assert.deepEqual(stateFromEvents(replay), { count: 2, kept: true, added: true });
+  assert.deepEqual(stateFromEvents((await chats.threadEvents("alice", "t-patch")) ?? []), {
+    count: 2,
+    kept: true,
+    added: true,
+  });
+  assert.equal(await chats.deleteThread("alice", "t-patch", "default"), "deleted");
+});
+
+test("recovery saves a journal whose state patches compaction cannot replay from {}", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  await chats.ensureThread("alice", "t-patch-crash", "default");
+  // Never started: once its patches are journaled it behaves like a dead process.
+  const dead = make();
+  const pause = gate();
+  const run = collect(
+    dead.run(
+      requestWithState(
+        patchAgent([replaceCount, replaceMissing], pause.promise),
+        "t-patch-crash",
+        "patch-crash-1",
+        { count: 1 },
+      ),
+    ),
+  );
+  await waitFor(async () => (await journalCount("patch-crash-1")) >= 3, "journal");
+  // Another process's connect replays what the journal holds.
+  const journaled = await within(
+    collect(make().connect({ threadId: "t-patch-crash" })).finished,
+    "journal replay",
+  );
+  assert.deepEqual(stateFromEvents(journaled), { count: 2 });
+  // A restart on the embedded database recovers the run at once and unlocks the thread.
+  await make({ exclusive: true, staleAfterMs: 60_000, sweepMs: 60_000 }).start();
+  assert.equal(await chats.isLocked("t-patch-crash"), false);
+  const row = await runRow("patch-crash-1");
+  assert.equal(row?.status, "interrupted");
+  assert.deepEqual(stateFromEvents(row?.events ?? []), { count: 2 });
+  assert.equal(await journalCount("patch-crash-1"), 0);
+  pause.open();
+  assert.equal(field((await run.finished).at(-1), "code"), persistenceFailedCode);
+});
+
+test("replay and the thread routes tolerate a stored state patch that applies to nothing", async () => {
+  await chats.ensureThread("alice", "t-raw-patch", "default");
+  const stored = [
+    {
+      type: EventType.RUN_STARTED,
+      threadId: "t-raw-patch",
+      runId: "raw-patch-1",
+      input: {
+        threadId: "t-raw-patch",
+        runId: "raw-patch-1",
+        messages: [],
+        tools: [],
+        context: [],
+      },
+    },
+    { type: EventType.STATE_DELTA, delta: replaceMissing },
+    { type: EventType.RUN_FINISHED, threadId: "t-raw-patch", runId: "raw-patch-1" },
+  ];
+  await db.sql(
+    `INSERT INTO chat_runs(run_id, thread_id, status, events, finished_at)
+    VALUES ('raw-patch-1', 't-raw-patch', 'finished', $1::jsonb, now())`,
+    [JSON.stringify(stored)],
+  );
+  const replay = await within(
+    collect(make().connect({ threadId: "t-raw-patch" })).finished,
+    "replay",
+  );
+  assert.deepEqual(types(replay), [EventType.RUN_STARTED, EventType.RUN_FINISHED]);
+  assert.deepEqual(types((await chats.threadEvents("alice", "t-raw-patch")) ?? []), [
+    EventType.RUN_STARTED,
+    EventType.RUN_FINISHED,
+  ]);
+});
+
+test("an unexpected failure while saving still ends the stream and leaves the run to the sweep", async (t) => {
+  t.mock.method(console, "error", () => {});
+  await chats.ensureThread("alice", "t-finalize", "default");
+  const runner = make({ heartbeatMs: 10, staleAfterMs: 100, sweepMs: 20 });
+  await runner.start();
+  const internals = runner as unknown as { closeWithRetry: (input: unknown) => Promise<boolean> };
+  const original = internals.closeWithRetry.bind(runner);
+  let saves = 0;
+  t.mock.method(internals, "closeWithRetry", async (input: unknown) => {
+    if (saves++ === 0) throw new Error("unexpected");
+    return original(input);
+  });
+  const events = await within(
+    collect(
+      runner.run(
+        request(replyAgent("a1", ["Hel", "lo"]), "t-finalize", "finalize-1", [user("u1", "Q")]),
+      ),
+    ).finished,
+    "the stream to end",
+  );
+  assert.equal(events.at(-1)?.type, EventType.RUN_ERROR);
+  assert.equal(field(events.at(-1), "code"), persistenceFailedCode);
+  // The run left the runner, so its lock is no longer refreshed: the sweep recovers it.
+  await waitFor(async () => !(await chats.isLocked("t-finalize")), "sweep recovery");
+  assert.equal(await runner.isRunning({ threadId: "t-finalize" }), false);
+  const row = await runRow("finalize-1");
+  assert.equal(row?.status, "interrupted");
+  assert.deepEqual(toWireMessages(messagesFromEvents(row?.events ?? [])), [
+    { id: "u1", role: "user", content: "Q" },
+    { id: "a1", role: "assistant", content: "Hello" },
+  ]);
+  const closing = Date.now();
+  await runner.close();
+  assert.ok(Date.now() - closing < 1000, "close() has no run left to wait for");
+});
+
+test("a run that begins and is saved while a connect reads history is sent once", async (t) => {
+  await chats.ensureThread("alice", "t-race-late", "default");
+  const runner = make();
+  const original = db.sql.bind(db);
+  const reading = gate();
+  const saving = gate();
+  let reads = 0;
+  let saved = false;
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (text.includes("/* chat:closed-runs */") && reads++ === 0) await reading.promise;
+    if (!text.includes("/* chat:close */")) return original(text, params);
+    // The save commits, but the runner only sees it once `saving` opens (a pg Pool can answer the
+    // history read in between).
+    const result = await original(text, params);
+    saved = true;
+    await saving.promise;
+    return result;
+  });
+  // The connect finds no live run, then its history read waits.
+  const connection = collect(runner.connect({ threadId: "t-race-late" }));
+  await waitFor(() => reads > 0, "history read");
+  const run = collect(
+    runner.run(
+      request(replyAgent("a1", ["Hel", "lo"]), "t-race-late", "late-1", [user("u1", "Hi")]),
+    ),
+  );
+  await waitFor(() => saved, "the run's save");
+  // The history read now sees the saved run, which is still the live run in this process.
+  reading.open();
+  const events = await within(connection.finished, "the connect to end");
+  saving.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal(events.filter((event) => event.type === EventType.RUN_STARTED).length, 1);
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Hello" },
+  ]);
+});
+
+test("a run whose runId runs on another thread is refused and releases its own claim", async () => {
+  await chats.ensureThread("alice", "t-dup-a", "default");
+  const runner = make();
+  const pause = gate();
+  const first = collect(
+    runner.run(request(replyAgent("a1", ["one", "two"], pause.promise), "t-dup-a", "dup-run")),
+  );
+  await waitFor(() => hasDelta(first.events, "one"), "first run");
+  assert.deepEqual(
+    await runner.claim({
+      owner: "alice",
+      threadId: "t-dup-b",
+      agentId: "default",
+      runId: "dup-run",
+    }),
+    { ok: true },
+  );
+  const refused = await collect(runner.run(request(replyAgent("a2", ["x"]), "t-dup-b", "dup-run")))
+    .finished;
+  assert.deepEqual(types(refused), [EventType.RUN_ERROR]);
+  assert.equal(field(refused[0], "code"), "agent_thread_locked");
+  assert.equal(await chats.isLocked("t-dup-b"), false);
+  assert.equal(await chats.isLocked("t-dup-a"), true);
+  pause.open();
+  assert.equal((await first.finished).at(-1)?.type, EventType.RUN_FINISHED);
 });

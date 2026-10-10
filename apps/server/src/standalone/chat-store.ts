@@ -2,8 +2,9 @@
 // Schema and statements: see the standalone plan (chat_threads, chat_runs, chat_events).
 // Store.sql has no transactions (a pg Pool hands out one connection per query), so every multi-row
 // state change below is ONE statement; Postgres runs data-modifying CTEs atomically.
-import { type BaseEvent, compactEvents } from "@ag-ui/client";
+import type { BaseEvent } from "@ag-ui/client";
 import type { Store } from "../db.ts";
+import { compactLeniently } from "./events.ts";
 import type {
   DeleteResult,
   ListThreadsQuery,
@@ -77,6 +78,9 @@ CREATE TABLE IF NOT EXISTS chat_runs(
   finished_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS chat_runs_thread ON chat_runs(thread_id, position);
+-- The sweep's scans (every 15 s in each process): running runs, and closed runs by age (retention).
+CREATE INDEX IF NOT EXISTS chat_runs_running ON chat_runs(thread_id) WHERE status='running';
+CREATE INDEX IF NOT EXISTS chat_runs_closed_age ON chat_runs(finished_at) WHERE status<>'running';
 CREATE TABLE IF NOT EXISTS chat_events(
   run_id text NOT NULL REFERENCES chat_runs(run_id) ON DELETE CASCADE,
   seq integer NOT NULL,
@@ -125,8 +129,8 @@ export function toJsonb(value: unknown): string {
   );
 }
 
-const timestampText =
-  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,6})?([+-]\d{2}(:?\d{2})?|Z)?$/;
+/** A list cursor's sort key: microseconds since 1970 (independent of the server's DateStyle). */
+const epochMicros = /^\d{1,18}$/;
 
 function encodeCursor(key: string, id: string): string {
   return Buffer.from(JSON.stringify({ k: key, id })).toString("base64url");
@@ -138,7 +142,7 @@ function decodeCursor(cursor: string): { k: string; id: string } {
     const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
     if (!value || typeof value !== "object") throw new CursorError();
     const { k, id } = value as { k?: unknown; id?: unknown };
-    if (typeof k !== "string" || !timestampText.test(k)) throw new CursorError();
+    if (typeof k !== "string" || !epochMicros.test(k)) throw new CursorError();
     if (typeof id !== "string" || id.length === 0 || id.length > 256) throw new CursorError();
     return { k, id };
   } catch {
@@ -192,10 +196,12 @@ export class ChatStore implements StandaloneThreadStore {
     let rows: (ThreadRow & { sort_key: string })[];
     try {
       rows = await this.db.sql(
-        `/* chat:list */ SELECT ${threadColumns}, coalesce(last_run_at, created_at)::text AS sort_key
+        `/* chat:list */ SELECT ${threadColumns},
+          (extract(epoch FROM coalesce(last_run_at, created_at)) * 1000000)::bigint::text AS sort_key
         FROM chat_threads
         WHERE owner=$1 AND agent_id=$2 AND last_run_at IS NOT NULL AND ($3::boolean OR NOT archived)
-          AND ($4::timestamptz IS NULL OR (coalesce(last_run_at, created_at), id) < ($4::timestamptz, $5::text))
+          AND ($4::bigint IS NULL OR (coalesce(last_run_at, created_at), id)
+            < (timestamptz 'epoch' + $4::bigint * interval '1 microsecond', $5::text))
         ORDER BY coalesce(last_run_at, created_at) DESC, id DESC
         LIMIT $6`,
         [
@@ -264,7 +270,7 @@ export class ChatStore implements StandaloneThreadStore {
     );
     const row = rows[0];
     if (!row || row.owner !== owner) return null;
-    return compactEvents(row.runs.flat());
+    return compactLeniently(row.runs.flat());
   }
 
   // ---- Runner statements (LocalAgentRunner). Not owner-scoped: the hooks check ownership. ----
@@ -329,7 +335,8 @@ export class ChatStore implements StandaloneThreadStore {
       ), kept AS (
         UPDATE chat_threads t SET ${unlock}
         WHERE t.id=$1 AND t.run_id=$2 AND NOT EXISTS (SELECT 1 FROM gone)
-          AND NOT EXISTS (SELECT 1 FROM chat_runs r WHERE r.run_id=$2 AND r.status='running')
+          AND NOT EXISTS (
+            SELECT 1 FROM chat_runs r WHERE r.run_id=$2 AND r.thread_id=t.id AND r.status='running')
         RETURNING t.id
       )
       SELECT ((SELECT count(*) FROM gone) + (SELECT count(*) FROM kept))::int AS released`,

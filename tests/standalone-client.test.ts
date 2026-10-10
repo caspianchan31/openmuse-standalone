@@ -145,14 +145,31 @@ test("the app client runs over SSE, then a reload replays the saved conversation
 });
 
 test("a send on a busy thread is refused as a thread lock the app holds", async (t) => {
-  t.mock.method(console, "error", () => {}); // CopilotKit logs the refused run
+  const consoleErrors = t.mock.method(console, "error", () => {});
   const threadId = randomUUID();
   assert.deepEqual(
     await chat.runner.claim({ owner: "local-user", threadId, agentId: "default", runId: "held" }),
     { ok: true },
   );
-  const { core, agent } = await client(threadId);
+  const { core, agent, errors } = await client(threadId);
   agent.addMessage({ id: randomUUID(), role: "user", content: "Hello" });
+  // A queued message (chat.tsx passes the agent): the 409 is claimed, so neither @ag-ui/client
+  // ("Agent execution failed") nor CopilotKit (onError, which CopilotKitProvider logs) reports it.
+  await assert.rejects(
+    runConversationTurn(
+      "default",
+      () => core.runAgent({ agent }),
+      (onError) => core.subscribe({ onError }),
+      [],
+      agent,
+    ),
+    (error: unknown) => error instanceof ConversationTurnError && error.code === threadLocked,
+  );
+  assert.equal(errors.length, 0);
+  assert.equal(consoleErrors.mock.callCount(), 0);
+  assert.equal(agent.isRunning, false);
+
+  // Retry (no held message) still reports the lock, which the chat shows as an error.
   await assert.rejects(
     runConversationTurn(
       "default",
@@ -161,6 +178,7 @@ test("a send on a busy thread is refused as a thread lock the app holds", async 
     ),
     (error: unknown) => error instanceof ConversationTurnError && error.code === threadLocked,
   );
+  assert.ok(errors.includes("agent_run_failed"));
   await chat.runner.release(threadId, "held");
   assert.equal(await chat.runner.isRunning({ threadId }), false);
 });
@@ -258,4 +276,90 @@ test("a reload replays a failed turn without reporting its old error again", asy
       ["assistant", "Partial"],
     ],
   );
+});
+
+/** An agent whose reply finishes once `paused` resolves. */
+class PausedAgent extends AbstractAgent {
+  constructor(private readonly paused: Promise<void>) {
+    super({ agentId: "default" });
+  }
+
+  run(input: RunAgentInput): Observable<BaseEvent> {
+    return new Observable<BaseEvent>((subscriber) => {
+      subscriber.next({
+        type: EventType.RUN_STARTED,
+        threadId: input.threadId,
+        runId: input.runId,
+      } as BaseEvent);
+      void this.paused.then(() => {
+        subscriber.next({
+          type: EventType.RUN_FINISHED,
+          threadId: input.threadId,
+          runId: input.runId,
+        } as BaseEvent);
+        subscriber.complete();
+      });
+    });
+  }
+}
+
+test("a lock found after the stream began is held silently and frees the thread", async (t) => {
+  const consoleErrors = t.mock.method(console, "error", () => {});
+  // A reply running on another thread under the runId this client will send.
+  const busyThread = randomUUID();
+  const runId = randomUUID();
+  assert.deepEqual(
+    await chat.runner.claim({
+      owner: "local-user",
+      threadId: busyThread,
+      agentId: "default",
+      runId,
+    }),
+    { ok: true },
+  );
+  let finish = () => {};
+  const busyAgent = new PausedAgent(
+    new Promise<void>((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const input: RunAgentInput = {
+    threadId: busyThread,
+    runId,
+    messages: [{ id: randomUUID(), role: "user", content: "Hi" }],
+    tools: [],
+    context: [],
+    state: {},
+    forwardedProps: {},
+  };
+  busyAgent.setMessages(input.messages);
+  busyAgent.threadId = busyThread;
+  const busy = new Promise<BaseEvent[]>((resolve, reject) => {
+    chat.runner
+      .run({ threadId: busyThread, agent: busyAgent, input })
+      .pipe(toArray())
+      .subscribe({ next: resolve, error: reject });
+  });
+
+  // The hook claims this thread, then the runner refuses the run inside the stream (RUN_ERROR
+  // agent_thread_locked): the app holds the message without reporting an error.
+  const threadId = randomUUID();
+  const { core, agent, errors } = await client(threadId);
+  agent.addMessage({ id: randomUUID(), role: "user", content: "Hello" });
+  await assert.rejects(
+    runConversationTurn(
+      "default",
+      () => core.runAgent({ agent, runId }),
+      (onError) => core.subscribe({ onError }),
+      [],
+      agent,
+    ),
+    (error: unknown) => error instanceof ConversationTurnError && error.code === threadLocked,
+  );
+  assert.deepEqual(errors, []);
+  assert.equal(consoleErrors.mock.callCount(), 0);
+  // The refused request's claim is undone, so the thread is free for the next send.
+  assert.equal(await chat.runner.isRunning({ threadId }), false);
+  finish();
+  assert.equal((await busy).at(-1)?.type, EventType.RUN_FINISHED);
 });

@@ -75,6 +75,16 @@ test("open is idempotent and creates the chat tables", async () => {
     tables.map((row) => row.name),
     ["chat_events", "chat_runs", "chat_threads"],
   );
+  // The sweep's scans of running runs and of closed runs by age are indexed.
+  const indexes = await db.sql<{ name: string; definition: string }>(
+    "SELECT indexname AS name, indexdef AS definition FROM pg_indexes WHERE tablename='chat_runs'",
+  );
+  const definition = (name: string) => indexes.find((index) => index.name === name)?.definition;
+  assert.match(definition("chat_runs_running") ?? "", /\(thread_id\) WHERE \(status = 'running'/);
+  assert.match(
+    definition("chat_runs_closed_age") ?? "",
+    /\(finished_at\) WHERE \(status <> 'running'/,
+  );
 });
 
 test("ensureThread creates once and refuses another owner's id", async () => {
@@ -137,13 +147,41 @@ test("listThreads: ran threads only, newest first, paginated, owner and agent sc
   );
 });
 
+test("list cursors do not depend on the database's DateStyle", async (t) => {
+  const owner = "datestyle";
+  for (const id of ["style-a", "style-b", "style-c"]) {
+    await chats.ensureThread(owner, id, "default");
+    await storeRun(id, `${id}-run`, "hi");
+  }
+  // Two threads at the same instant: the id orders them.
+  await db.sql(
+    "UPDATE chat_threads SET last_run_at=(SELECT last_run_at FROM chat_threads WHERE id='style-a') WHERE id='style-b'",
+  );
+  t.after(() => db.sql("SET DateStyle = 'ISO, MDY'"));
+  for (const style of ["ISO, MDY", "SQL, DMY", "Postgres, MDY", "German"]) {
+    await db.sql(`SET DateStyle = '${style}'`);
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page++) {
+      const result = await chats.listThreads(owner, { agentId: "default", limit: 1, cursor });
+      seen.push(...result.threads.map((thread) => thread.id));
+      if (!result.nextCursor) break;
+      cursor = result.nextCursor;
+    }
+    assert.deepEqual(seen, ["style-c", "style-b", "style-a"], style);
+  }
+});
+
 test("listThreads rejects bad cursors with CursorError", async () => {
   for (const cursor of [
     "%%%",
     Buffer.from("not json").toString("base64url"),
     Buffer.from(JSON.stringify({ k: "yesterday", id: "x" })).toString("base64url"),
     Buffer.from(JSON.stringify({ k: "2026-13-45 99:00:00+00", id: "x" })).toString("base64url"),
-    Buffer.from(JSON.stringify({ k: "2026-01-01 00:00:00+00" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ k: "2026-01-01 00:00:00+00", id: "x" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ k: "-1", id: "x" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ k: "1".repeat(19), id: "x" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ k: "1760000000000000" })).toString("base64url"),
   ]) {
     await assert.rejects(
       chats.listThreads("lister", { agentId: "default", cursor }),

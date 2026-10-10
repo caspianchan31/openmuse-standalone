@@ -22,7 +22,7 @@ A wrong key is not a fallback: with any non-blank key the API uses Intelligence 
 # CHAT_RETENTION_DAYS=90
 ```
 
-`CHAT_RETENTION_DAYS` must be a positive whole number; the API refuses to start otherwise. It has no effect in Intelligence mode.
+In local mode `CHAT_RETENTION_DAYS` must be a positive whole number; the API refuses to start otherwise. Intelligence mode ignores it.
 
 For production, point `DATABASE_URL` at Postgres and back it up like any other application data. With embedded PGlite, conversations are in `DATA_DIR/postgres` next to the rest of OpenMuse's data; a host without a persistent disk loses them on redeploy.
 
@@ -36,7 +36,7 @@ For production, point `DATABASE_URL` at Postgres and back it up like any other a
 | Delete a thread | Yes, refused with 409 while it is replying | Yes |
 | Reload replays the conversation | Yes (`connectAgent` replays saved runs) | Yes |
 | Reload during a reply resumes the reply | Yes, when the reply runs in the same API process (also one that is just starting) | Yes |
-| A second send while a reply runs | 409 `agent_thread_locked`, the app holds the queued message | `AgentThreadLockedError`, same handling |
+| A second send while a reply runs | 409 `agent_thread_locked`, the app holds the queued message (no console error; the browser still lists the 409 request) | `AgentThreadLockedError`, same handling |
 | Stop | Yes; the reply stops streaming at once and what it said so far is saved | Yes |
 | Thread list refreshes live on other devices | No: the menu refetches each time it opens | Yes (realtime metadata) |
 | Live tail of a reply running in another API process | No: a reload there shows the reply's progress so far, then ends | Yes |
@@ -84,7 +84,9 @@ Invalid input is `400`; a missing thread, another owner's thread or a different 
 | `chat_runs` | One row per reply: thread, order, status (`running`, `finished`, `error`, `stopped`, `interrupted`) and, once closed, its compacted AG-UI events and message ids |
 | `chat_events` | A journal of the events of replies that are still running, written every 250 ms (or every 64 events), so a crash loses at most the last quarter second of a reply |
 
-Each saved run starts with `RUN_STARTED` carrying only the messages that were new to the thread. Tools, context, state and forwarded properties sent by the app are not stored (tools and context are saved as empty lists, which the client requires on replay). Every saved `RUN_FINISHED` carries its thread and run ids.
+Each saved run starts with `RUN_STARTED` carrying only the messages that were new to the thread. Tools, context, state and forwarded properties in that input are not stored (tools and context are saved as empty lists, which the client requires on replay). Every saved `RUN_FINISHED` carries its thread and run ids.
+
+A run's state events are saved as one `STATE_SNAPSHOT` of the state it ended with: the state it began with plus its `STATE_DELTA` patches. A patch that cannot be applied (a path that does not exist) is dropped, as the agent and the app skip it with a warning, so it never keeps a reply from being saved or replayed, or its thread from being freed.
 
 ## Replay
 
@@ -96,7 +98,7 @@ There is no replay cursor in local mode, so every connect sends the whole thread
 
 ## Durability and recovery
 
-- The final `RUN_FINISHED` or `RUN_ERROR` is sent to the app only after the reply is saved. If saving fails after retries, the stream ends with `RUN_ERROR` code `persistence_failed` ("This reply could not be saved…"), and the journal is recovered once the database is reachable again. The stream also ends with `persistence_failed` if another process had already recovered the reply from its journal (its database calls stalled past the heartbeat window), because the saved reply is then the shorter recovered one.
+- The final `RUN_FINISHED` or `RUN_ERROR` is sent to the app only after the reply is saved. If saving fails after retries, or in any unexpected way, the stream ends with `RUN_ERROR` code `persistence_failed` ("This reply could not be saved…"), the process stops refreshing the reply's lock, and the journal is recovered by the sweep once the lock is stale and the database is reachable. The stream also ends with `persistence_failed` if another process had already recovered the reply from its journal (its database calls stalled past the heartbeat window), because the saved reply is then the shorter recovered one.
 - A failure after the stream started ends it with `RUN_ERROR`; it never hangs. Closing the browser tab does not stop the reply; reopening the conversation resumes it.
 - The process holding a reply refreshes its lock every 5 seconds. A lock without a heartbeat for 30 seconds is recovered by a sweep (every 15 seconds): the journal is saved as an `interrupted` reply with the message "The server stopped before this reply finished." and the thread is unlocked.
 - At startup with embedded PGlite (no `DATABASE_URL`), no other process can use the database, so every lock left by the previous process is recovered at once. With `DATABASE_URL`, other processes may hold live locks, so a reply cut off by a crash stays locked until its heartbeat is 30 seconds old and is recovered within the next sweep (about 30-45 seconds); meanwhile the app holds new messages for that thread.
@@ -117,6 +119,7 @@ The default deployment is still a single-owner workspace protected by one access
 
 - `tests/standalone-routes.test.ts`: runtime hooks and thread routes against in-memory stores, and the hooks inside the real CopilotKit runtime handler.
 - `tests/standalone-api.test.ts`: keyless `createApp` through the real runtime HTTP path with the sample agent: no Intelligence calls, main thread, SSE runs, listing, messages, replay, 409 before SSE, owner isolation, claim release, pagination and mutations.
-- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), a second connect that does not double the messages, a failed reply replayed without an error, and a send on a busy thread surfacing as the thread lock the app holds.
+- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), a second connect that does not double the messages, a failed reply replayed without an error, and a send on a busy thread (409, or a lock found after the stream began) surfacing as the thread lock the app holds, without a console error.
+- `tests/standalone-agui.test.ts`: keyless `createApp` with a remote AG-UI agent whose state patches only apply to the run's starting state, or to none: the runs finish, the state is saved, and the thread can be used and deleted.
 - `tests/standalone-runner.test.ts` and `tests/standalone-chat-store.test.ts`: persistence, replay after restart, durability boundary, concurrency, stop (including an agent whose `abortRun` is a no-op), shutdown caps, heartbeat, crash recovery at startup and by sweep, connect races, claim cleanup and retention.
 - `tests/rich-threads.test.ts` keeps covering Intelligence mode unchanged.

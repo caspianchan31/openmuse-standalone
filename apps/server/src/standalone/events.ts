@@ -61,6 +61,70 @@ export function withRunIdentity(event: BaseEvent, threadId: string, runId: strin
 }
 
 /**
+ * compactEvents for stored and replayed events, which must never fail on what an agent sent.
+ * compactEvents replays each run's STATE_DELTA patches with validation and throws on one that
+ * cannot apply (a path that does not exist, a malformed patch). The agent and the client only warn
+ * about such a patch and keep their state, so here it is dropped the same way and the rest is
+ * compacted.
+ */
+export function compactLeniently(events: BaseEvent[]): BaseEvent[] {
+  try {
+    return compactEvents(events);
+  } catch {
+    return compactEvents(withoutFailingDeltas(events));
+  }
+}
+
+/** The events without the STATE_DELTA events compactEvents cannot apply, in its segments (runs). */
+function withoutFailingDeltas(events: BaseEvent[]): BaseEvent[] {
+  // The segment's state so far, as one STATE_SNAPSHOT (none yet: compactEvents starts from {}).
+  let state: BaseEvent | undefined;
+  return events.filter((event) => {
+    switch (event.type) {
+      case EventType.RUN_STARTED:
+      case EventType.RUN_FINISHED:
+      case EventType.RUN_ERROR:
+        state = undefined;
+        return true;
+      case EventType.STATE_SNAPSHOT:
+        state = event;
+        return true;
+      case EventType.STATE_DELTA:
+        try {
+          // compactEvents applies the one patch exactly as it would in the whole segment.
+          state = compactEvents(state ? [state, event] : [event])[0];
+          return true;
+        } catch {
+          return false;
+        }
+      default:
+        return true;
+    }
+  });
+}
+
+/**
+ * The events of one run with the state it began with (its RUN_STARTED input.state) ahead of its
+ * state events. compactEvents rebuilds a run's state from {}, while the agent and the client apply
+ * its STATE_DELTA patches to that starting state: a patch of an existing key would not apply, and
+ * the snapshot would lack the keys the run did not touch. With it, the stored snapshot is the state
+ * the run ended with.
+ */
+function withStartState(events: BaseEvent[]): BaseEvent[] {
+  if (!events.some((event) => event.type === EventType.STATE_DELTA)) return events;
+  const index = events.findIndex((event) => event.type === EventType.RUN_STARTED);
+  const state = (events[index] as RunStartedEvent | undefined)?.input?.state;
+  if (state === null || typeof state !== "object") return events;
+  const snapshot = { type: EventType.STATE_SNAPSHOT, snapshot: state } as BaseEvent;
+  return [...events.slice(0, index + 1), snapshot, ...events.slice(index + 1)];
+}
+
+/** One run's events (saved or journaled) compacted for storage or replay; never throws on state. */
+export function compactRun(events: BaseEvent[]): BaseEvent[] {
+  return compactLeniently(withStartState(events));
+}
+
+/**
  * The persisted form of one run: compacted, RUN_STARTED first with input reduced to
  * { threadId, runId, messages (only those new to the thread), tools: [], context: [] }, and every
  * RUN_FINISHED carrying the run's threadId and runId.
@@ -70,7 +134,7 @@ export function persistedRunEvents(
   run: { threadId: string; runId: string; newMessages: Message[] },
 ): BaseEvent[] {
   const out: BaseEvent[] = [];
-  for (const event of compactEvents(events)) {
+  for (const event of compactRun(events)) {
     if (event.type !== EventType.RUN_STARTED) {
       out.push(withRunIdentity(event, run.threadId, run.runId));
       continue;

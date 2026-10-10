@@ -60,12 +60,59 @@ export function showsRunError(
   return true;
 }
 
-/** CopilotKit emits run failures through onError even when runAgent resolves. */
+/**
+ * What claimThreadLock needs from the agent (an @ag-ui/client AbstractAgent). Results are
+ * `unknown` because @ag-ui/client types onRunFailed's result without stopPropagation, although
+ * AbstractAgent.onError honours it (it then neither logs nor rethrows the failure);
+ * tests/standalone-client.test.ts pins that against the real client.
+ */
+export interface LockableAgent {
+  subscribe(subscriber: {
+    onRunFailed?(params: { error: Error }): unknown;
+    onRunErrorEvent?(params: { event: { code?: string; message?: string } }): unknown;
+  }): { unsubscribe(): void };
+}
+
+/**
+ * Standalone: claims a thread-lock refusal of the agent's next run, for a turn that puts its
+ * message back on hold, so the refusal is expected rather than an error. Returning stopPropagation
+ * from the agent subscriber keeps @ag-ui/client ("Agent execution failed") and CopilotKit (its
+ * onError, which CopilotKitProvider logs) from reporting it on the console; this subscriber runs
+ * before CopilotKit's own run subscriber. The refusal is a 409 before streaming (local mode), an
+ * AgentThreadLockedError (Intelligence), or a RUN_ERROR with the lock code. Other failures pass.
+ * If a client version stopped honouring stopPropagation here, the refusal would still be held:
+ * CopilotKit would then report it as before, and runConversationTurn rethrows it either way.
+ */
+export function claimThreadLock(agent: LockableAgent) {
+  let refusal: Error | undefined;
+  const subscription = agent.subscribe({
+    onRunFailed: ({ error }) => {
+      if (!isThreadLocked({ error })) return undefined;
+      refusal ??= error;
+      return { stopPropagation: true };
+    },
+    onRunErrorEvent: ({ event }) => {
+      if (event.code !== threadLocked) return undefined;
+      refusal ??= Object.assign(new Error(event.message ?? "The conversation is busy."), {
+        code: threadLocked,
+      });
+      return { stopPropagation: true };
+    },
+  });
+  return { refusal: () => refusal, unsubscribe: () => subscription.unsubscribe() };
+}
+
+/**
+ * CopilotKit emits run failures through onError even when runAgent resolves. With holdOnLock, a
+ * thread-lock refusal of that agent's run is claimed (see claimThreadLock) and rethrown here as a
+ * threadLocked turn error.
+ */
 export async function runConversationTurn(
   agentId: string,
   execute: () => Promise<unknown>,
   subscribe: (listener: (event: RunError) => void) => { unsubscribe: () => void },
   ignore: readonly string[] = [],
+  holdOnLock?: LockableAgent,
 ) {
   let failure: ConversationTurnError | undefined;
   const subscription = subscribe((event) => {
@@ -75,10 +122,14 @@ export async function runConversationTurn(
     // The first report is the specific one; CopilotKit follows it with a generic agent_run_failed.
     failure ??= new ConversationTurnError(error, isThreadLocked(event) ? threadLocked : event.code);
   });
+  const lock = holdOnLock ? claimThreadLock(holdOnLock) : undefined;
   try {
     await execute();
+    const refusal = lock?.refusal();
+    if (refusal) throw new ConversationTurnError(refusal, threadLocked);
     if (failure) throw failure;
   } finally {
     subscription.unsubscribe();
+    lock?.unsubscribe();
   }
 }
