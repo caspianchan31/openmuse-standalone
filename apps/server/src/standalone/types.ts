@@ -86,7 +86,7 @@ export interface StandaloneRunControl {
 }
 
 export interface LocalRunnerOptions {
-  /** Identifies this process's locks; default randomUUID(). */
+  /** Identifies this process's locks; default randomUUID(). start() recovers locks left under it. */
   instanceId?: string;
   /** Lock heartbeat interval; default 5000. */
   heartbeatMs?: number;
@@ -98,6 +98,11 @@ export interface LocalRunnerOptions {
   flushMs?: number;
   /** Delete closed runs older than this many days; unset keeps history forever. */
   retentionDays?: number;
+  /**
+   * No other process can use the database (embedded PGlite): every lock found at start() belongs
+   * to a previous process and is recovered at once instead of after staleAfterMs.
+   */
+  exclusive?: boolean;
 }
 
 /** Messages rebuilt from stored events, in the runtime's /threads/:id/messages wire shape. */

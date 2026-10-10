@@ -8,14 +8,23 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import {
+  AbstractAgent,
+  type BaseEvent,
+  EventType,
+  type Message,
+  type RunAgentInput,
+} from "@ag-ui/client";
 import { CopilotKitCore, CopilotKitCoreRuntimeConnectionStatus } from "@copilotkit/core";
 import { type ServerType, serve } from "@hono/node-server";
+import { Observable, toArray } from "rxjs";
 import {
   ConversationTurnError,
   replayedRunError,
   runConversationTurn,
   threadLocked,
 } from "../apps/mobile/src/conversation-run.ts";
+import { connectThread } from "../apps/mobile/src/local-thread.ts";
 import { createApp } from "../apps/server/src/app.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import type { StandaloneChat } from "../apps/server/src/standalone/index.ts";
@@ -154,4 +163,99 @@ test("a send on a busy thread is refused as a thread lock the app holds", async 
   );
   await chat.runner.release(threadId, "held");
   assert.equal(await chat.runner.isRunning({ threadId }), false);
+});
+
+const assistantText = (messages: Message[]) =>
+  messages
+    .filter((message) => message.role === "assistant")
+    .map((message) => String(message.content ?? ""));
+
+test("connecting again to a loaded thread (Retry, reopening it) does not double its messages", async () => {
+  const threadId = randomUUID();
+  const first = await client(threadId);
+  first.agent.addMessage({ id: randomUUID(), role: "user", content: "Show my calendar" });
+  await first.turn(() => first.core.runAgent({ agent: first.agent }));
+  const sent = first.agent.messages.map((message) => message.id);
+  const replies = assistantText(first.agent.messages);
+  assert.ok(replies.some((text) => /Your local calendar has/.test(text)));
+
+  const reloaded = await client(threadId);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await reloaded.turn(
+      () => connectThread(reloaded.core, reloaded.agent, true),
+      [replayedRunError],
+    );
+    assert.deepEqual(
+      reloaded.agent.messages.map((message) => message.id),
+      sent,
+      `connect ${attempt + 1}`,
+    );
+    assert.deepEqual(assistantText(reloaded.agent.messages), replies, `connect ${attempt + 1}`);
+  }
+  assert.deepEqual(reloaded.errors, []);
+});
+
+/** An agent whose model fails after part of a reply. */
+class FailingAgent extends AbstractAgent {
+  run(input: RunAgentInput): Observable<BaseEvent> {
+    return new Observable<BaseEvent>((subscriber) => {
+      subscriber.next({
+        type: EventType.RUN_STARTED,
+        threadId: input.threadId,
+        runId: input.runId,
+      } as BaseEvent);
+      subscriber.next({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: "failed-reply",
+        role: "assistant",
+      } as BaseEvent);
+      subscriber.next({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: "failed-reply",
+        delta: "Partial",
+      } as BaseEvent);
+      const failing = setTimeout(() => subscriber.error(new Error("model unavailable")), 10);
+      return () => clearTimeout(failing);
+    });
+  }
+}
+
+test("a reload replays a failed turn without reporting its old error again", async (t) => {
+  t.mock.method(console, "error", () => {}); // the server logs the failed run
+  const threadId = randomUUID();
+  assert.deepEqual(
+    await chat.runner.claim({ owner: "local-user", threadId, agentId: "default", runId: "failed" }),
+    { ok: true },
+  );
+  const agent = new FailingAgent({ agentId: "default" });
+  const input: RunAgentInput = {
+    threadId,
+    runId: "failed",
+    messages: [{ id: "failed-question", role: "user", content: "Hi" }],
+    tools: [],
+    context: [],
+    state: {},
+    forwardedProps: {},
+  };
+  agent.setMessages(input.messages);
+  agent.threadId = threadId;
+  const live = await new Promise<BaseEvent[]>((resolve, reject) => {
+    chat.runner
+      .run({ threadId, agent, input })
+      .pipe(toArray())
+      .subscribe({ next: resolve, error: reject });
+  });
+  assert.equal(live.at(-1)?.type, EventType.RUN_ERROR);
+
+  const reloaded = await client(threadId);
+  // No ignore list: a replayed RUN_ERROR would fail this turn and log a console error.
+  await reloaded.turn(() => connectThread(reloaded.core, reloaded.agent, true));
+  assert.deepEqual(reloaded.errors, []);
+  assert.deepEqual(
+    reloaded.agent.messages.map((message) => [message.role, message.content]),
+    [
+      ["user", "Hi"],
+      ["assistant", "Partial"],
+    ],
+  );
 });

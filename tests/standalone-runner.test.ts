@@ -11,6 +11,7 @@ import { Observable } from "rxjs";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { ChatStore } from "../apps/server/src/standalone/chat-store.ts";
 import { messagesFromEvents, toWireMessages } from "../apps/server/src/standalone/events.ts";
+import { createStandaloneChat } from "../apps/server/src/standalone/index.ts";
 import {
   LocalAgentRunner,
   lockedMessage,
@@ -23,6 +24,8 @@ type Step = { event: Record<string, unknown> } | { gate: Promise<void> } | { fai
 /** A scripted agent: emits its steps, waits at gates, and ends with AbortError when aborted. */
 class FakeAgent extends AbstractAgent {
   aborts = 0;
+  /** Times the runner unsubscribed from (or completed) a run's stream. */
+  teardowns = 0;
   private stopCurrent?: () => void;
   private abortEarly = false;
 
@@ -64,6 +67,7 @@ class FakeAgent extends AbstractAgent {
       })();
       return () => {
         stopped = true;
+        this.teardowns++;
       };
     });
   }
@@ -78,8 +82,21 @@ class FakeAgent extends AbstractAgent {
     const copy = super.clone() as FakeAgent;
     copy.script = this.script;
     copy.aborts = 0;
+    copy.teardowns = 0;
     return copy;
   }
+}
+
+/** Like ConversationAgent: abortRun is AbstractAgent's no-op; only unsubscribing ends its stream. */
+class DeafAgent extends FakeAgent {
+  override abortRun() {
+    this.aborts++;
+  }
+}
+
+/** Ignores abortRun and detachActiveRun alike: only shutdown's cap ends its run. */
+class StuckAgent extends DeafAgent {
+  override async detachActiveRun() {}
 }
 
 function gate() {
@@ -159,6 +176,21 @@ async function waitFor(check: () => boolean | Promise<boolean>, label: string, t
   while (!(await check())) {
     if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** The promise's value, or a failure after timeoutMs, so a regression fails instead of hanging. */
+async function within<T>(promise: Promise<T>, label: string, timeoutMs = 5000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -459,7 +491,7 @@ test("stop: another instance's run stops through stop_requested on its heartbeat
   await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
   assert.equal(await elsewhere.stop({ threadId: "t-xstop", runId: "nope" }), false);
   assert.equal(await elsewhere.stop({ threadId: "t-xstop" }), true);
-  const events = await run.finished;
+  const events = await within(run.finished, "the heartbeat to stop the run");
   assert.equal(agent.aborts, 1);
   assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
   assert.equal((await runRow("xstop-1"))?.status, "stopped");
@@ -523,13 +555,28 @@ test("crash recovery closes a dead instance's run from its journal and releases 
     { id: "u1", role: "user", content: "Tell me" },
     { id: "a1", role: "assistant", content: "part" },
   ]);
+  // Replay ends the recovered turn with RUN_FINISHED: the stored RUN_ERROR is not re-reported.
   const replay = await collect(survivor.connect({ threadId: "t-crash" })).finished;
-  assert.equal(replay.at(-1)?.type, EventType.RUN_ERROR);
+  assert.ok(!replay.some((event) => event.type === EventType.RUN_ERROR));
+  assert.equal(replay.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal(field(replay.at(-1), "threadId"), "t-crash");
+  assert.equal(field(replay.at(-1), "runId"), "crash-1");
 
-  // The "dead" run finishing late changes nothing that was recovered.
+  // The "dead" run finishing late changes nothing that was recovered, and its client is told the
+  // reply it saw was not saved (the stored one is the shorter recovered reply).
   pause.open();
-  await run.finished;
-  assert.equal((await runRow("crash-1"))?.status, "interrupted");
+  const late = await run.finished;
+  assert.ok(hasDelta(late, "ial"));
+  assert.ok(!late.some((event) => event.type === EventType.RUN_FINISHED));
+  assert.equal(late.at(-1)?.type, EventType.RUN_ERROR);
+  assert.equal(field(late.at(-1), "code"), persistenceFailedCode);
+  const after = await runRow("crash-1");
+  assert.equal(after?.status, "interrupted");
+  assert.deepEqual(toWireMessages(messagesFromEvents(after?.events ?? [])).at(-1), {
+    id: "a1",
+    role: "assistant",
+    content: "part",
+  });
 });
 
 test("retention purges old closed runs and never touches running runs", async () => {
@@ -705,4 +752,268 @@ test("the journal flushes by batch size before the flush timer fires", async () 
     EventType.RUN_FINISHED,
   ]);
   assert.equal(field(stored[2], "delta"), `${deltas.join("")}end`);
+});
+
+test("stop ends a reply whose agent ignores abortRun, as ConversationAgent does", async () => {
+  await chats.ensureThread("alice", "t-deaf", "default");
+  const runner = make();
+  const pause = gate();
+  const agent = new DeafAgent((input) => [
+    started(input),
+    textStart("a1"),
+    textDelta("a1", "Hel"),
+    { gate: pause.promise },
+    textDelta("a1", "lo, and much more"),
+    textEnd("a1"),
+    finished(input),
+  ]);
+  const run = collect(runner.run(request(agent, "t-deaf", "deaf-1", [user("u1", "Hi")])));
+  await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
+  assert.equal(await runner.stop({ threadId: "t-deaf" }), true);
+  // The stream ends while the agent would still be producing: the runner unsubscribed from it.
+  const events = await within(run.finished, "the stopped run to end");
+  assert.equal(agent.aborts, 1);
+  assert.ok(agent.teardowns >= 1, "the agent's stream was unsubscribed");
+  assert.deepEqual(types(events).slice(-2), [EventType.TEXT_MESSAGE_END, EventType.RUN_FINISHED]);
+  const row = await runRow("deaf-1");
+  assert.equal(row?.status, "stopped");
+  assert.deepEqual(toWireMessages(messagesFromEvents(row?.events ?? [])), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Hel" },
+  ]);
+  assert.equal(await chats.isLocked("t-deaf"), false);
+  pause.open();
+
+  // A stop requested before the run began (through the lock row) also ends such an agent.
+  assert.deepEqual(
+    await runner.claim({ owner: "alice", threadId: "t-deaf", agentId: "default", runId: "deaf-2" }),
+    { ok: true },
+  );
+  assert.equal(await chats.requestStop("t-deaf", "deaf-2"), true);
+  const pending = gate();
+  const early = new DeafAgent((input) => [
+    started(input),
+    { gate: pending.promise },
+    finished(input),
+  ]);
+  const stoppedEarly = await within(
+    collect(runner.run(request(early, "t-deaf", "deaf-2"))).finished,
+    "the run stopped before it began to end",
+  );
+  assert.equal(stoppedEarly.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal((await runRow("deaf-2"))?.status, "stopped");
+  pending.open();
+});
+
+test("close() ends a reply whose agent ignores abortRun without waiting for the cap", async () => {
+  await chats.ensureThread("alice", "t-deaf-close", "default");
+  const runner = make();
+  runner.closeCapMs = 10_000;
+  const pause = gate();
+  const agent = new DeafAgent((input) => [
+    started(input),
+    textStart("a1"),
+    textDelta("a1", "Hel"),
+    { gate: pause.promise },
+    textEnd("a1"),
+    finished(input),
+  ]);
+  const run = collect(runner.run(request(agent, "t-deaf-close", "deaf-close-1")));
+  await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
+  await within(runner.close(), "close without the cap");
+  const events = await run.finished;
+  assert.equal(field(events.at(-1), "message"), "The server is restarting.");
+  assert.equal((await runRow("deaf-close-1"))?.status, "interrupted");
+  assert.equal(await chats.isLocked("t-deaf-close"), false);
+  pause.open();
+});
+
+test("close() still saves a reply whose agent ignores abort and detach, after the cap", async () => {
+  await chats.ensureThread("alice", "t-stuck", "default");
+  const runner = make();
+  runner.closeCapMs = 50;
+  const pause = gate();
+  const agent = new StuckAgent((input) => [
+    started(input),
+    textStart("a1"),
+    textDelta("a1", "Hel"),
+    { gate: pause.promise },
+    textEnd("a1"),
+    finished(input),
+  ]);
+  const run = collect(runner.run(request(agent, "t-stuck", "stuck-1")));
+  await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
+  await runner.close();
+  assert.equal(run.state.done, true);
+  const events = await run.finished;
+  assert.equal(events.at(-1)?.type, EventType.RUN_ERROR);
+  assert.equal(field(events.at(-1), "message"), "The server is restarting.");
+  const row = await runRow("stuck-1");
+  assert.equal(row?.status, "interrupted");
+  assert.equal(await chats.isLocked("t-stuck"), false);
+  pause.open();
+});
+
+test("the heartbeat keeps a long reply's lock from being recovered by another instance", async (t) => {
+  await chats.ensureThread("alice", "t-beat", "default");
+  const original = db.sql.bind(db);
+  let sweeps = 0;
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (text.includes("chat:stale")) sweeps++;
+    return original(text, params);
+  });
+  const owner = make({ heartbeatMs: 10, staleAfterMs: 100, sweepMs: 60_000 });
+  await owner.start();
+  const watcher = make({ heartbeatMs: 10, staleAfterMs: 100, sweepMs: 10 });
+  const pause = gate();
+  const run = collect(
+    owner.run(request(replyAgent("a1", ["Hel", "lo"], pause.promise), "t-beat", "beat-1")),
+  );
+  await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
+  await watcher.start();
+  // Well past the stale threshold, with the watcher sweeping every 10 ms.
+  const from = sweeps;
+  await waitFor(() => sweeps - from >= 20, "watcher sweeps");
+  assert.equal((await runRow("beat-1"))?.status, "running");
+  assert.equal(await chats.isLocked("t-beat"), true);
+  pause.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal((await runRow("beat-1"))?.status, "finished");
+});
+
+test("start() recovers at once a lock left under its instance id, or any lock when exclusive", async () => {
+  for (const [label, deadOptions, nextOptions] of [
+    ["same instance id", { instanceId: "api-1" }, { instanceId: "api-1" }],
+    ["exclusive database", {}, { exclusive: true }],
+  ] as const) {
+    const threadId = `t-start-${label.replaceAll(" ", "-")}`;
+    await chats.ensureThread("alice", threadId, "default");
+    // The previous process: never started (no heartbeat), its lock still fresh.
+    const dead = make(deadOptions);
+    const pause = gate();
+    const run = collect(
+      dead.run(
+        request(replyAgent("a1", ["part", "ial"], pause.promise), threadId, `${threadId}-run`, [
+          user("u1", "Tell me"),
+        ]),
+      ),
+    );
+    await waitFor(async () => (await journalCount(`${threadId}-run`)) >= 3, "journal");
+    const next = make({ ...nextOptions, staleAfterMs: 60_000, sweepMs: 60_000 });
+    await next.start();
+    assert.equal(await chats.isLocked(threadId), false, label);
+    const row = await runRow(`${threadId}-run`);
+    assert.equal(row?.status, "interrupted", label);
+    assert.deepEqual(toWireMessages(messagesFromEvents(row?.events ?? [])), [
+      { id: "u1", role: "user", content: "Tell me" },
+      { id: "a1", role: "assistant", content: "part" },
+    ]);
+    pause.open();
+    assert.equal(field((await run.finished).at(-1), "code"), persistenceFailedCode);
+  }
+  // A fresh lock of another live instance is not touched by a non-exclusive start.
+  await chats.ensureThread("alice", "t-start-live", "default");
+  const live = make();
+  const pause = gate();
+  const run = collect(
+    live.run(request(replyAgent("a1", ["x", "y"], pause.promise), "t-start-live", "live-run")),
+  );
+  await waitFor(() => hasDelta(run.events, "x"), "streaming");
+  await make({ staleAfterMs: 60_000, sweepMs: 60_000 }).start();
+  assert.equal((await runRow("live-run"))?.status, "running");
+  pause.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+});
+
+test("the standalone chat treats embedded PGlite as exclusive and DATABASE_URL as shared", async () => {
+  const auth = { owner: async () => "alice" };
+  const embedded = await createStandaloneChat({ db, auth, config: {} });
+  const shared = await createStandaloneChat({
+    db,
+    auth,
+    config: { databaseUrl: "postgres://elsewhere/openmuse" },
+  });
+  runners.push(embedded.runner, shared.runner);
+  assert.equal(embedded.runner.options.exclusive, true);
+  assert.equal(shared.runner.options.exclusive, false);
+});
+
+test("a run saved while a connect reads history is sent once, from the live run", async (t) => {
+  await chats.ensureThread("alice", "t-race", "default");
+  const runner = make();
+  const original = db.sql.bind(db);
+  const reading = gate();
+  let holdReads = false;
+  let reads = 0;
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (holdReads && text.includes("chat:closed-runs")) {
+      reads++;
+      await reading.promise;
+    }
+    return original(text, params);
+  });
+  const pause = gate();
+  const run = collect(
+    runner.run(
+      request(replyAgent("a1", ["Hel", "lo"], pause.promise), "t-race", "race-1", [
+        user("u1", "Hi"),
+      ]),
+    ),
+  );
+  await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
+  holdReads = true;
+  const connection = collect(runner.connect({ threadId: "t-race" }));
+  await waitFor(() => reads > 0, "history read");
+  pause.open();
+  await run.finished;
+  assert.equal((await runRow("race-1"))?.status, "finished");
+  reading.open();
+  const events = await connection.finished;
+  assert.deepEqual(types(events), [
+    EventType.RUN_STARTED,
+    EventType.TEXT_MESSAGE_START,
+    EventType.TEXT_MESSAGE_CONTENT,
+    EventType.TEXT_MESSAGE_CONTENT,
+    EventType.TEXT_MESSAGE_END,
+    EventType.RUN_FINISHED,
+  ]);
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Hello" },
+  ]);
+});
+
+test("a connect between the claim and the run's start waits for the run and tails it", async () => {
+  const runner = make();
+  const claim = (runId: string) =>
+    runner.claim({ owner: "alice", threadId: "t-window", agentId: "default", runId });
+  assert.deepEqual(await claim("win-1"), { ok: true });
+  const connection = collect(runner.connect({ threadId: "t-window" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(connection.state.done, false, "the connect waits for the claimed run");
+  const pause = gate();
+  const run = collect(
+    runner.run(
+      request(replyAgent("a1", ["Hel", "lo"], pause.promise), "t-window", "win-1", [
+        user("u1", "Hi"),
+      ]),
+    ),
+  );
+  await waitFor(() => hasDelta(connection.events, "Hel"), "connect tails the run");
+  assert.equal(connection.state.done, false);
+  pause.open();
+  await run.finished;
+  const events = await connection.finished;
+  assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Hello" },
+  ]);
+
+  // A claim released without a run: the waiting connect ends with the history.
+  assert.deepEqual(await claim("win-2"), { ok: true });
+  const idle = collect(runner.connect({ threadId: "t-window" }));
+  await runner.release("t-window", "win-2");
+  const replayed = await idle.finished;
+  assert.equal(replayed.filter((event) => event.type === EventType.RUN_STARTED).length, 1);
 });

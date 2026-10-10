@@ -295,3 +295,44 @@ test("claim, begin and release statements guard the lock", async () => {
   assert.equal(await chats.isLocked("lock-1"), false);
   assert.equal(await chats.isLocked("lock-missing"), false);
 });
+
+test("releasing a claim deletes a thread row that never ran; ran, named or archived rows stay", async () => {
+  const claim = (threadId: string, runId: string) =>
+    chats.claimRun({
+      owner: "keeper",
+      threadId,
+      agentId: "default",
+      runId,
+      instanceId: "test",
+      staleAfterMs: 30_000,
+    });
+  // A refused first run (unknown agent, invalid body) leaves no row behind.
+  assert.equal((await claim("rel-new", "n1")).claimed, true);
+  assert.equal(await chats.releaseClaim("rel-new", "n1"), true);
+  assert.equal(await chats.threadOwner("rel-new"), null);
+  // A thread that has run keeps its row and history; only the lock is released.
+  await chats.ensureThread("keeper", "rel-ran", "default");
+  await storeRun("rel-ran", "ran-1", "kept");
+  assert.equal((await claim("rel-ran", "ran-2")).claimed, true);
+  assert.equal(await chats.releaseClaim("rel-ran", "ran-2"), true);
+  assert.equal(await chats.threadOwner("rel-ran"), "keeper");
+  assert.equal(await chats.isLocked("rel-ran"), false);
+  assert.equal((await chats.historicMessageIds("rel-ran")).length > 0, true);
+  // A renamed or archived thread that has not run yet keeps its row.
+  for (const [id, patch] of [
+    ["rel-named", { name: "Plans" }],
+    ["rel-archived", { archived: true }],
+  ] as const) {
+    await chats.ensureThread("keeper", id, "default");
+    await chats.updateThread("keeper", id, "default", patch);
+    assert.equal((await claim(id, `${id}-run`)).claimed, true);
+    assert.equal(await chats.releaseClaim(id, `${id}-run`), true);
+    assert.equal(await chats.threadOwner(id), "keeper");
+    assert.equal(await chats.isLocked(id), false);
+  }
+  // A release for another run id changes nothing.
+  assert.equal((await claim("rel-other", "o1")).claimed, true);
+  assert.equal(await chats.releaseClaim("rel-other", "o2"), false);
+  assert.equal(await chats.isLocked("rel-other"), true);
+  assert.equal(await chats.releaseClaim("rel-other", "o1"), true);
+});

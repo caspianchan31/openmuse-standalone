@@ -322,6 +322,36 @@ test("another owner gets 404 for every thread route and agent route, and takes n
   assert.equal(record?.archived, false);
 });
 
+test("a run with an unusable runId is refused with 400, so it cannot write to another owner's thread", async () => {
+  const threadId = randomUUID();
+  await runTurn(threadId, [userMessage("Show my calendar")]);
+  const before = await (await get(`/api/copilotkit/threads/${threadId}/messages`)).json();
+  // The runtime accepts any string id; an unclaimed run would skip the owner check and take the
+  // idle thread. Both requests must be refused before the runtime runs anything.
+  for (const runId of ["", "x".repeat(300)]) {
+    const response = await send(
+      "POST",
+      "/api/copilotkit/agent/default/run",
+      runInput(threadId, [userMessage(`Injected by B ${runId.length}`)], runId),
+      otherToken,
+    );
+    assert.equal(response.status, 400, `runId of ${runId.length} characters`);
+    assert.doesNotMatch(response.headers.get("content-type") ?? "", /text\/event-stream/);
+  }
+  assert.equal(await chat.runner.isRunning({ threadId }), false);
+  const after = await (await get(`/api/copilotkit/threads/${threadId}/messages`)).json();
+  assert.deepEqual(after, before);
+  assert.doesNotMatch(JSON.stringify(after), /Injected by B/);
+  // The owner's own run with such an id is refused the same way, and the thread stays usable.
+  const own = await send(
+    "POST",
+    "/api/copilotkit/agent/default/run",
+    runInput(threadId, [userMessage("Hi")], ""),
+  );
+  assert.equal(own.status, 400);
+  await runTurn(threadId, [userMessage("Show my calendar again")]);
+});
+
 test("a run the runtime refuses releases its claim", async () => {
   const threadId = randomUUID();
   const unknownAgent = await send(

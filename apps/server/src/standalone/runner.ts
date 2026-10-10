@@ -22,8 +22,14 @@ import {
 } from "@copilotkit/runtime/v2";
 import { type Observable, ReplaySubject } from "rxjs";
 import { backgroundFailure } from "../log.ts";
-import type { BeginResult, ChatStore, RunStatus } from "./chat-store.ts";
-import { messageIdsOf, persistedRunEvents, startedEvent, withRunIdentity } from "./events.ts";
+import type { BeginResult, ChatStore, DeadLocks, RunStatus } from "./chat-store.ts";
+import {
+  messageIdsOf,
+  persistedRunEvents,
+  replayedRun,
+  startedEvent,
+  withRunIdentity,
+} from "./events.ts";
 import {
   type ClaimResult,
   type LocalRunnerOptions,
@@ -39,7 +45,6 @@ const restartingMessage = "The server is restarting.";
 const crashedMessage = "The server stopped before this reply finished.";
 const startFailedMessage = "This conversation could not be started. Try again.";
 const journalBatch = 64;
-const closeCapMs = 5000;
 
 interface ActiveRun {
   threadId: string;
@@ -64,6 +69,13 @@ interface ActiveRun {
   markDone: () => void;
 }
 
+/** A claim this process took whose run has not begun yet. */
+interface PendingClaim {
+  runId: string;
+  begun: Promise<void>;
+  settle: () => void;
+}
+
 interface Begun {
   run: ActiveRun;
   historic: Set<string>;
@@ -78,11 +90,6 @@ function isTerminal(event: BaseEvent): boolean {
   return event.type === EventType.RUN_FINISHED || event.type === EventType.RUN_ERROR;
 }
 
-function messageIdOf(event: BaseEvent): string | undefined {
-  const id = (event as { messageId?: unknown }).messageId;
-  return typeof id === "string" ? id : undefined;
-}
-
 const delay = (ms: number) =>
   new Promise<void>((resolve) => {
     setTimeout(resolve, ms).unref();
@@ -92,11 +99,14 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
   readonly instanceId: string;
   /** Backoff before each retry of a failed close statement (3 retries). Tests shorten it. */
   closeRetryDelaysMs = [500, 1000, 2000];
+  /** Longest wait for one shutdown step, and for a connect waiting on a claimed run to begin. */
+  closeCapMs = 5000;
   private readonly heartbeatMs: number;
   private readonly staleAfterMs: number;
   private readonly sweepMs: number;
   private readonly flushMs: number;
   private readonly active = new Map<string, ActiveRun>();
+  private readonly claimed = new Map<string, PendingClaim>();
   private timers: ReturnType<typeof setInterval>[] = [];
   private started = false;
   private closed = false;
@@ -132,10 +142,7 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
 
   connect(request: AgentRunnerConnectRequest): Observable<BaseEvent> {
     const subject = new ReplaySubject<BaseEvent>(Infinity);
-    // Capture the live run first: it is excluded from the stored history read below, and its
-    // ReplaySubject replays it from the start, so nothing is lost or sent twice.
-    const local = this.active.get(request.threadId);
-    void this.replay(request.threadId, local, subject).catch((error) => {
+    void this.replay(request.threadId, subject).catch((error) => {
       backgroundFailure("standalone chat connect", error);
       subject.error(error);
     });
@@ -187,13 +194,42 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
       await this.recover(input.threadId, row.holder, this.staleAfterMs);
       row = await attempt();
     }
-    if (row.claimed) return { ok: true };
+    if (row.claimed) {
+      this.trackClaim(input.threadId, input.runId);
+      return { ok: true };
+    }
     if (row.owner !== null && row.owner !== input.owner) return { ok: false, reason: "forbidden" };
     return { ok: false, reason: "locked" };
   }
 
   async release(threadId: string, runId: string): Promise<void> {
+    this.settleClaim(threadId, runId);
     await this.store.releaseClaim(threadId, runId);
+  }
+
+  /** Remembers a claim until its run begins, so a connect in between waits for the run. */
+  private trackClaim(threadId: string, runId: string) {
+    let resolve = () => {};
+    const entry: PendingClaim = {
+      runId,
+      begun: new Promise<void>((done) => {
+        resolve = done;
+      }),
+      settle: () => {
+        if (this.claimed.get(threadId) === entry) this.claimed.delete(threadId);
+        resolve();
+      },
+    };
+    this.claimed.get(threadId)?.settle();
+    this.claimed.set(threadId, entry);
+    // A claim whose run never begins and is never released (its request failed in between) is
+    // forgotten once its lock would be stale.
+    setTimeout(entry.settle, this.staleAfterMs).unref();
+  }
+
+  private settleClaim(threadId: string, runId: string) {
+    const entry = this.claimed.get(threadId);
+    if (entry?.runId === runId) entry.settle();
   }
 
   // ---- Lifecycle ----
@@ -202,8 +238,9 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
   async start(): Promise<void> {
     if (this.started || this.closed) return;
     this.started = true;
-    // Locks under this instance id belong to a previous process: nothing of ours runs yet.
-    await this.sweep(this.instanceId);
+    // Nothing of ours runs yet, so locks under this instance id belong to a previous process; when
+    // no other process can use the database (embedded PGlite), every lock does.
+    await this.sweep(this.options.exclusive ? { all: true } : { instanceId: this.instanceId });
     const heartbeat = setInterval(() => void this.heartbeat(), this.heartbeatMs);
     const sweep = setInterval(() => void this.sweep(), this.sweepMs);
     heartbeat.unref();
@@ -221,23 +258,20 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     this.closed = true;
     for (const timer of this.timers) clearInterval(timer);
     this.timers = [];
-    await Promise.race([Promise.all(this.starting), delay(closeCapMs)]);
+    for (const claim of [...this.claimed.values()]) claim.settle();
+    await Promise.race([Promise.all(this.starting), delay(this.closeCapMs)]);
     const runs = [...this.active.values()];
     for (const run of runs) {
       run.closing = true;
       run.stopRequested = false;
-      try {
-        run.agent.abortRun();
-      } catch (error) {
-        backgroundFailure("standalone chat abort", error);
-      }
+      this.cancel(run);
     }
     await Promise.all(
       runs.map(async (run) => {
-        await Promise.race([run.done, delay(closeCapMs)]);
+        await Promise.race([run.done, delay(this.closeCapMs)]);
         // An agent that ignores abort is finalized without it; its later events are dropped.
         if (!run.finalized)
-          await Promise.race([this.finalize(run, restartingMessage), delay(closeCapMs)]);
+          await Promise.race([this.finalize(run, restartingMessage), delay(this.closeCapMs)]);
       }),
     );
     if (this.sweeping) await this.sweeping;
@@ -263,6 +297,7 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     } finally {
       this.starting.delete(starting);
       started();
+      this.settleClaim(request.threadId, request.input.runId);
     }
     if (!begun) return;
     const { run, historic } = begun;
@@ -367,6 +402,8 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     input: AgentRunnerRunRequest["input"],
   ) {
     if (run.finalized) return;
+    // A stop or shutdown that came before the agent's stream was set up could not detach it yet.
+    if (run.stopRequested || run.closing) this.detach(run);
     if (event.type === EventType.RUN_STARTED) {
       // As InMemoryAgentRunner: a RUN_STARTED without input carries the request input with only
       // the messages new to the thread.
@@ -389,10 +426,30 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
 
   private abort(run: ActiveRun) {
     run.stopRequested = true;
+    this.cancel(run);
+  }
+
+  /**
+   * Ends the agent's run: abortRun for agents that implement it, then detaches the run, which
+   * unsubscribes from the agent's stream. AbstractAgent.abortRun is a no-op, and ConversationAgent
+   * cancels its model stream only when unsubscribed. runAgent then resolves and the run finalizes.
+   */
+  private cancel(run: ActiveRun) {
     try {
       run.agent.abortRun();
     } catch (error) {
       backgroundFailure("standalone chat abort", error);
+    }
+    this.detach(run);
+  }
+
+  private detach(run: ActiveRun) {
+    try {
+      void run.agent.detachActiveRun().catch((error: unknown) => {
+        backgroundFailure("standalone chat detach", error);
+      });
+    } catch (error) {
+      backgroundFailure("standalone chat detach", error);
     }
   }
 
@@ -430,7 +487,9 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
   /**
    * Saves the run (one close statement, retried) and only then sends the held terminal event and
    * ends the stream. If the save keeps failing, the stream ends with persistence_failed and the
-   * lock is left to go stale, so a sweep closes the run from its journal.
+   * lock is left to go stale, so a sweep closes the run from its journal. If another process had
+   * already recovered the run from its journal (its lock went stale), the stored reply is that
+   * shorter one, so the stream ends with persistence_failed too.
    */
   private async finalize(run: ActiveRun, interruption?: string): Promise<void> {
     if (run.finalized) return;
@@ -474,11 +533,11 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     run.markDone();
   }
 
+  /** True once this run's events are saved; false when they were not (failed, or closed elsewhere). */
   private async closeWithRetry(input: Parameters<ChatStore["closeRun"]>[0]): Promise<boolean> {
     for (let attempt = 0; ; attempt++) {
       try {
-        await this.store.closeRun(input);
-        return true;
+        return (await this.store.closeRun(input)).closed;
       } catch (error) {
         backgroundFailure("standalone chat save", error);
         const wait = this.closeRetryDelaysMs[attempt];
@@ -490,29 +549,23 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
 
   // ---- Connect ----
 
-  private async replay(
-    threadId: string,
-    captured: ActiveRun | undefined,
-    subject: ReplaySubject<BaseEvent>,
-  ) {
+  private async replay(threadId: string, subject: ReplaySubject<BaseEvent>) {
+    // A run this process claimed but has not begun yet (one statement away): wait for it, so the
+    // connect tails it instead of finding the thread idle.
+    const pending = this.claimed.get(threadId);
+    if (pending) await Promise.race([pending.begun, delay(this.closeCapMs)]);
+    // Capture the live run before the history read: it is excluded from that read, and its
+    // ReplaySubject replays it from the start, so nothing is lost or sent twice.
+    const captured = this.active.get(threadId);
     const runs = await this.store.closedRunEvents(threadId, captured?.runId);
-    const emitted = new Set<string>();
-    for (const event of compactEvents(runs.flat())) {
-      subject.next(event);
-      const id = messageIdOf(event);
-      if (id) emitted.add(id);
-    }
+    for (const event of compactEvents(runs.flatMap(replayedRun))) subject.next(event);
     // A run that began after the capture is tailed too, unless the history read already saw it.
     const live = captured ?? this.active.get(threadId);
     const stored = (run: ActiveRun) =>
       runs.some((events) => events.some((e) => (e as { runId?: unknown }).runId === run.runId));
     if (live && (live === captured || !stored(live))) {
       live.subject.subscribe({
-        next: (event) => {
-          const id = messageIdOf(event);
-          if (id && emitted.has(id)) return;
-          subject.next(event);
-        },
+        next: (event) => subject.next(event),
         complete: () => subject.complete(),
         error: (error) => subject.error(error),
       });
@@ -520,13 +573,7 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     }
     // A run held by another process: send what its journal holds (no cross-process live tail).
     const journal = live ? null : await this.store.runningJournal(threadId);
-    if (journal && journal.length > 0) {
-      for (const event of compactEvents(journal)) {
-        const id = messageIdOf(event);
-        if (id && emitted.has(id)) continue;
-        subject.next(event);
-      }
-    }
+    if (journal) for (const event of compactEvents(journal)) subject.next(event);
     subject.complete();
   }
 
@@ -558,12 +605,12 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     }
   }
 
-  /** Recovers stale locks and applies retention. Never throws. */
-  async sweep(deadInstance?: string): Promise<void> {
+  /** Recovers stale locks (and every lock of a dead holder) and applies retention. Never throws. */
+  async sweep(dead?: DeadLocks): Promise<void> {
     if (this.sweeping) return this.sweeping;
     this.sweeping = (async () => {
       try {
-        const stale = await this.store.staleRuns(this.staleAfterMs, deadInstance);
+        const stale = await this.store.staleRuns(this.staleAfterMs, dead);
         for (const lock of stale) {
           if (this.isLocalRun(lock.threadId, lock.runId)) continue;
           try {

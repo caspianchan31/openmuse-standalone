@@ -21,10 +21,12 @@ import { CursorError } from "../apps/server/src/standalone/chat-store.ts";
 import {
   chatUnavailableMessage,
   localThreadEndpoints,
+  runIdsRequired,
   standaloneRuntimeHooks,
   threadLockedMessage,
 } from "../apps/server/src/standalone/runtime-hooks.ts";
 import {
+  realtimeUnavailable,
   standaloneThreadRoutes,
   type ThreadView,
 } from "../apps/server/src/standalone/thread-routes.ts";
@@ -362,23 +364,34 @@ test("a non-200 runtime answer releases the claim the hook took", async () => {
   }
 });
 
-test("a run without usable ids is left to the runtime's 400 and claims nothing", async () => {
-  const { runner, hooks } = fixture();
+test("a run without usable ids answers 400 before the runtime runs and claims nothing", async () => {
+  const { threads, runner, hooks } = fixture();
+  threads.add("alice", "alice-thread");
   const route = { method: "agent/run", agentId: "default" } as const;
+  // Not a JSON object: the runtime's own body validation answers 400.
+  for (const body of ["not json", []]) {
+    const req = request("/api/copilotkit/agent/default/run", { owner: "bob", body });
+    assert.equal(await hooks.onBeforeHandler(handlerContext(req, route)), undefined);
+    await hooks.onResponse(responseContext(req, route, Response.json({}, { status: 400 })));
+  }
+  // An object whose ids the hook cannot claim: the runtime would accept any string and run it
+  // unclaimed, without the owner check, so the hook refuses it, here on another owner's thread.
   for (const body of [
-    "not json",
-    [],
     { runId: "run" },
     { threadId: "", runId: "run" },
     { threadId: "thread", runId: 7 },
     { threadId: "t".repeat(257), runId: "run" },
+    { threadId: "alice-thread", runId: "" },
+    { threadId: "alice-thread", runId: "r".repeat(300) },
   ]) {
-    const req = request("/api/copilotkit/agent/default/run", { owner: "alice", body });
-    assert.equal(await hooks.onBeforeHandler(handlerContext(req, route)), undefined);
-    await hooks.onResponse(responseContext(req, route, Response.json({}, { status: 400 })));
+    const req = request("/api/copilotkit/agent/default/run", { owner: "bob", body });
+    const refused = await thrown(hooks.onBeforeHandler(handlerContext(req, route)));
+    assert.equal(refused.status, 400, JSON.stringify(body).slice(0, 80));
+    assert.deepEqual(await refused.json(), { error: runIdsRequired });
   }
   assert.deepEqual(runner.claims, []);
   assert.deepEqual(runner.releases, []);
+  assert.equal(threads.rows.get("alice-thread")?.runId, null);
 });
 
 test("another owner's thread is 404 on run, connect and stop, and no lock is taken", async () => {
@@ -956,10 +969,12 @@ test("thread mutations reject invalid bodies with 400", async () => {
   assert.ok(threads.rows.has("a1"));
 });
 
-test("routes the local layer does not serve fall through to the runtime", async () => {
+test("realtime subscribe is 404 locally; other routes the local layer does not serve fall through", async () => {
   const { call } = routesApp(new MemoryThreads());
+  const subscribe = await call("/api/copilotkit/threads/subscribe", { method: "POST", body: {} });
+  assert.equal(subscribe.status, 404);
+  assert.deepEqual(await subscribe.json(), { error: realtimeUnavailable });
   for (const [method, path] of [
-    ["POST", "/api/copilotkit/threads/subscribe"],
     ["POST", "/api/copilotkit/threads/clear"],
     ["GET", "/api/copilotkit/memories"],
     ["GET", "/api/copilotkit/threads/a/b/messages"],

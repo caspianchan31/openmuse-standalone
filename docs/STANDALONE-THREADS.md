@@ -35,9 +35,9 @@ For production, point `DATABASE_URL` at Postgres and back it up like any other a
 | Thread menu: list, paginate, rename, archive, restore | Yes (`/api/copilotkit/threads*`, served by OpenMuse) | Yes (runtime + Intelligence) |
 | Delete a thread | Yes, refused with 409 while it is replying | Yes |
 | Reload replays the conversation | Yes (`connectAgent` replays saved runs) | Yes |
-| Reload during a reply resumes the reply | Yes, when the reply runs in the same API process | Yes |
+| Reload during a reply resumes the reply | Yes, when the reply runs in the same API process (also one that is just starting) | Yes |
 | A second send while a reply runs | 409 `agent_thread_locked`, the app holds the queued message | `AgentThreadLockedError`, same handling |
-| Stop | Yes; the stopped reply is saved | Yes |
+| Stop | Yes; the reply stops streaming at once and what it said so far is saved | Yes |
 | Thread list refreshes live on other devices | No: the menu refetches each time it opens | Yes (realtime metadata) |
 | Live tail of a reply running in another API process | No: a reload there shows the reply's progress so far, then ends | Yes |
 | Automatic thread names | No (off in both modes) | No |
@@ -45,13 +45,15 @@ For production, point `DATABASE_URL` at Postgres and back it up like any other a
 
 Run one API process (the existing guidance for OpenMuse). A separate task worker can share the same Postgres; it never serves chat.
 
+Known limit: a message the app held because another device was replying is sent later with this device's copy of the conversation, so the model does not see the other device's turn (the saved history is still in the right order and a reload shows it).
+
 ## How it works
 
 Without a key, `createApp` builds the standalone chat layer in `apps/server/src/standalone/`:
 
 - `LocalAgentRunner` is the CopilotKit `AgentRunner` the runtime uses in SSE mode. It implements only the asynchronous `run`, `connect`, `isRunning` and `stop`, backed by the database, so nothing is held only in memory.
 - Runtime hooks run after the runtime's own route matching, so they apply to every path the runtime serves:
-  - **run**: before any SSE byte, the thread is claimed for the session owner. A thread that is already replying answers `409 {"error": "...", "code": "agent_thread_locked"}`; a thread that belongs to another owner answers `404`. If the runtime then answers anything other than `200` (bad body, unknown agent), the claim is released.
+  - **run**: before any SSE byte, the thread is claimed for the session owner. A thread that is already replying answers `409 {"error": "...", "code": "agent_thread_locked"}`; a thread that belongs to another owner answers `404`; a `threadId` or `runId` that is missing, empty or longer than 256 characters answers `400` (the runtime would accept any string and run it without a claim). If the runtime then answers anything other than `200` (bad body, unknown agent), the claim is released, and a thread row that has never run is removed again.
   - **connect** and **stop**: another owner's thread answers `404`.
   - **info**: `threadEndpoints` is rewritten to `{ list, inspect, mutations: true, realtimeMetadata: false }`, so the app uses the local thread routes and opens no realtime socket.
   - The runtime's debug event stream (`cpk-debug-events`) answers `404`, because it would carry every owner's events.
@@ -70,7 +72,7 @@ Hono routes serve the thread menu before the runtime handler, behind the normal 
 | `POST /api/copilotkit/threads/:id/archive` `{ agentId }` | `{ threadId, archived: true }` |
 | `DELETE /api/copilotkit/threads/:id` `{ agentId }` | `{ threadId, deleted: true }`, or 409 while replying |
 
-Invalid input is `400`; a missing thread, another owner's thread or a different `agentId` is `404`. `POST /threads/subscribe` (realtime) and memories are not served locally; `POST /threads/clear` is a no-op.
+Invalid input is `400`; a missing thread, another owner's thread or a different `agentId` is `404`. `POST /threads/subscribe` (realtime) answers `404 {"error": "Realtime thread updates are not available without Intelligence"}`; the app never calls it because `/info` reports `realtimeMetadata: false`. Memories are not served locally; `POST /threads/clear` is a no-op.
 
 ## Database
 
@@ -80,24 +82,34 @@ Invalid input is `400`; a missing thread, another owner's thread or a different 
 |---|---|
 | `chat_threads` | One row per thread: owner, agent, name, archived flag, timestamps, and the run lock (`run_id`, the process holding it, its heartbeat, a stop request) |
 | `chat_runs` | One row per reply: thread, order, status (`running`, `finished`, `error`, `stopped`, `interrupted`) and, once closed, its compacted AG-UI events and message ids |
-| `chat_events` | A journal of the events of replies that are still running, so a crash loses nothing that was streamed |
+| `chat_events` | A journal of the events of replies that are still running, written every 250 ms (or every 64 events), so a crash loses at most the last quarter second of a reply |
 
 Each saved run starts with `RUN_STARTED` carrying only the messages that were new to the thread. Tools, context, state and forwarded properties sent by the app are not stored (tools and context are saved as empty lists, which the client requires on replay). Every saved `RUN_FINISHED` carries its thread and run ids.
 
+## Replay
+
+`connectAgent` (a reload, or opening a thread) receives the thread's saved replies, compacted, then the reply in progress from its start if this process is running it. A connect that arrives just after a send was accepted but before the reply began waits for the reply and follows it.
+
+A failed or interrupted reply is replayed ending with `RUN_FINISHED` instead of its saved `RUN_ERROR`: the app shows no notice for a past failure after a reload, and replaying the error only made the client report it again (a console error per failed reply on every load). The stored reply keeps its `RUN_ERROR` and status, and `GET /threads/:id/events` returns it as stored.
+
+There is no replay cursor in local mode, so every connect sends the whole thread. The app therefore clears the conversation before each connect when `runtime.threads` is `"local"` (`apps/mobile/src/local-thread.ts`); otherwise a second connect to a loaded thread (Retry after a failed load, or reopening the thread) would append the replay to the messages already shown.
+
 ## Durability and recovery
 
-- The final `RUN_FINISHED` or `RUN_ERROR` is sent to the app only after the reply is saved. If saving fails after retries, the stream ends with `RUN_ERROR` code `persistence_failed` ("This reply could not be saved…"), and the journal is recovered once the database is reachable again.
+- The final `RUN_FINISHED` or `RUN_ERROR` is sent to the app only after the reply is saved. If saving fails after retries, the stream ends with `RUN_ERROR` code `persistence_failed` ("This reply could not be saved…"), and the journal is recovered once the database is reachable again. The stream also ends with `persistence_failed` if another process had already recovered the reply from its journal (its database calls stalled past the heartbeat window), because the saved reply is then the shorter recovered one.
 - A failure after the stream started ends it with `RUN_ERROR`; it never hangs. Closing the browser tab does not stop the reply; reopening the conversation resumes it.
-- The process holding a reply refreshes its lock every 5 seconds. A lock without a heartbeat for 30 seconds is recovered by a sweep (every 15 seconds and at startup): the journal is saved as an `interrupted` reply with the message "The server stopped before this reply finished." and the thread is unlocked.
-- On `SIGINT`/`SIGTERM` the API saves replies in progress as interrupted ("The server is restarting."), ends their streams, then closes.
+- The process holding a reply refreshes its lock every 5 seconds. A lock without a heartbeat for 30 seconds is recovered by a sweep (every 15 seconds): the journal is saved as an `interrupted` reply with the message "The server stopped before this reply finished." and the thread is unlocked.
+- At startup with embedded PGlite (no `DATABASE_URL`), no other process can use the database, so every lock left by the previous process is recovered at once. With `DATABASE_URL`, other processes may hold live locks, so a reply cut off by a crash stays locked until its heartbeat is 30 seconds old and is recovered within the next sweep (about 30-45 seconds); meanwhile the app holds new messages for that thread.
+- Stop cancels the agent's run: the runner calls `abortRun` and detaches the run, which unsubscribes from the agent's stream (OpenMuse's agent ends its model request when unsubscribed; `abortRun` alone is a no-op for it). The reply so far is saved as `stopped` and the stream ends with `RUN_FINISHED`.
+- On `SIGINT`/`SIGTERM` the API cancels replies in progress the same way, saves them as interrupted ("The server is restarting."), ends their streams, then closes. An agent that ignores both is saved after a 5-second cap.
 
 ## Retention
 
-History is kept until you delete a thread. With `CHAT_RETENTION_DAYS=N`, the sweep deletes finished replies older than N days; replies in progress are never touched. Thread rows and names stay, so an old thread can appear in the menu with an empty history. Deleting a thread removes its replies and journal. Nothing is evicted by count or size.
+History is kept until you delete a thread. With `CHAT_RETENTION_DAYS=N`, the sweep deletes finished replies older than N days; replies in progress are never touched. Thread rows and names stay, so an old thread can appear in the menu with an empty history. Deleting a thread removes its replies and journal. Nothing is evicted by count or size. A thread whose first run the runtime refused (unknown agent, invalid body) leaves no row behind.
 
 ## Owner isolation
 
-Every thread belongs to the owner whose session first created it. Thread ids are global: an id held by another owner is answered exactly like a missing thread (`404`), on the thread routes and on run, connect and stop, and a refused run takes no lock. Owner fields in requests (`userId` and similar) are ignored; the owner always comes from the verified session.
+Every thread belongs to the owner whose session first created it. Thread ids are global: an id held by another owner is answered exactly like a missing thread (`404`), on the thread routes and on run, connect and stop, and a refused run takes no lock. A run is only ever started after the hook has claimed its thread for the session owner: a run whose ids the hook cannot claim answers `400` instead of reaching the runtime. Owner fields in requests (`userId` and similar) are ignored; the owner always comes from the verified session.
 
 The default deployment is still a single-owner workspace protected by one access key (see the [README](../README.md)); per-owner isolation keeps thread data correct if more owners are added later.
 
@@ -105,6 +117,6 @@ The default deployment is still a single-owner workspace protected by one access
 
 - `tests/standalone-routes.test.ts`: runtime hooks and thread routes against in-memory stores, and the hooks inside the real CopilotKit runtime handler.
 - `tests/standalone-api.test.ts`: keyless `createApp` through the real runtime HTTP path with the sample agent: no Intelligence calls, main thread, SSE runs, listing, messages, replay, 409 before SSE, owner isolation, claim release, pagination and mutations.
-- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), and a send on a busy thread surfacing as the thread lock the app holds.
-- `tests/standalone-runner.test.ts` and `tests/standalone-chat-store.test.ts`: persistence, replay after restart, durability boundary, concurrency, stop, crash recovery and retention.
+- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), a second connect that does not double the messages, a failed reply replayed without an error, and a send on a busy thread surfacing as the thread lock the app holds.
+- `tests/standalone-runner.test.ts` and `tests/standalone-chat-store.test.ts`: persistence, replay after restart, durability boundary, concurrency, stop (including an agent whose `abortRun` is a no-op), shutdown caps, heartbeat, crash recovery at startup and by sweep, connect races, claim cleanup and retention.
 - `tests/rich-threads.test.ts` keeps covering Intelligence mode unchanged.

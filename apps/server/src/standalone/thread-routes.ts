@@ -47,10 +47,14 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 
 const notFound = () => new AppError("Thread not found", 404);
 
+/** Body of the 404 POST /threads/subscribe receives in local mode. */
+export const realtimeUnavailable = "Realtime thread updates are not available without Intelligence";
+
 /**
  * GET / (list), GET /:threadId/{messages,events,state}, PATCH /:threadId (rename/unarchive),
- * POST /:threadId/archive, DELETE /:threadId. Another owner's thread is 404. Owner-like fields in
- * the query or body (userId) are ignored: the owner is always the authenticated session's.
+ * POST /:threadId/archive, DELETE /:threadId; POST /subscribe answers 404 (no realtime). Another
+ * owner's thread is 404. Owner-like fields in the query or body (userId) are ignored: the owner is
+ * always the authenticated session's.
  */
 export function standaloneThreadRoutes(
   threads: StandaloneThreadStore,
@@ -80,6 +84,8 @@ export function standaloneThreadRoutes(
       throw error;
     }
   });
+  // Realtime thread updates need Intelligence; /info tells the client realtimeMetadata: false.
+  routes.post("/subscribe", (c) => c.json({ error: realtimeUnavailable }, 404));
   routes.get("/:threadId/messages", async (c) => {
     const events = await eventsOf(c.get("owner"), c.req.param("threadId"));
     return c.json({ messages: view.messages(events) });

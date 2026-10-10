@@ -91,6 +91,26 @@ export function persistedRunEvents(
   return out;
 }
 
+/**
+ * One saved run as connect replays it: its RUN_ERROR becomes a RUN_FINISHED with the run's ids.
+ * The stored run keeps the RUN_ERROR and its status. The app shows no notice for a past failure
+ * after a reload, and a replayed RUN_ERROR only made the client report that old error again (a
+ * console error per failed turn on every load).
+ */
+export function replayedRun(events: BaseEvent[]): BaseEvent[] {
+  if (!events.some((event) => event.type === EventType.RUN_ERROR)) return events;
+  const started = events.find((event) => event.type === EventType.RUN_STARTED) as Loose | undefined;
+  return events.map((event) =>
+    event.type === EventType.RUN_ERROR
+      ? ({
+          type: EventType.RUN_FINISHED,
+          threadId: started?.threadId,
+          runId: started?.runId,
+        } as BaseEvent)
+      : event,
+  );
+}
+
 /** Every messageId in the events plus RUN_STARTED input message ids. */
 export function messageIdsOf(events: BaseEvent[]): string[] {
   const ids = new Set<string>();

@@ -38,6 +38,7 @@ import {
 import { DesktopToolCard } from "./desktop-tool-card";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
+import { connectThread } from "./local-thread";
 import { MailToolCard } from "./mail-tool-card";
 import { SearchToolCard } from "./search-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
@@ -217,6 +218,8 @@ export function ChatScreen({
   const { enabled: richThreads, mainId, claimPrompt } = useMuseThread();
   const selection = thread || { id: "local", existing: false };
   const threadId = richThreads ? selection.id : "local-main";
+  // Standalone: conversations stored on this server replay in full on every connect.
+  const localThreads = w.runtime.threads === "local";
   const agentId = `openmuse-${threadId}`;
   const { agent, isReady } = useAgent({ agentId, runtimeAgentId: "default", threadId });
   const { copilotkit } = useCopilotKit();
@@ -287,7 +290,7 @@ export function ChatScreen({
             try {
               await runConversationTurn(
                 agentId,
-                () => copilotkit.connectAgent({ agent }),
+                () => connectThread(copilotkit, agent, localThreads),
                 (onError) => copilotkit.subscribe({ onError }),
                 [replayedRunError],
               );
@@ -316,7 +319,17 @@ export function ChatScreen({
       replay.unsubscribe();
       if (richThreads) void agent.detachActiveRun().catch(() => {});
     };
-  }, [agent, agentId, api, copilotkit, isReady, historyAttempt, richThreads, selection.existing]);
+  }, [
+    agent,
+    agentId,
+    api,
+    copilotkit,
+    isReady,
+    historyAttempt,
+    localThreads,
+    richThreads,
+    selection.existing,
+  ]);
   const saveHistory = useCallback(async () => {
     if (!richThreads) await api.request("/api/conversation", { messages: agent.messages }, "PUT");
     setSaveError("");

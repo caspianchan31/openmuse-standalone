@@ -23,11 +23,14 @@ export interface StandaloneChat {
 export async function createStandaloneChat(input: {
   db: Store;
   auth: Pick<Auth, "owner">;
-  config: Pick<Config, "chatRetentionDays">;
+  config: Pick<Config, "chatRetentionDays" | "databaseUrl">;
   runner?: Omit<LocalRunnerOptions, "retentionDays">;
 }): Promise<StandaloneChat> {
   const store = await ChatStore.open(input.db);
   const runner = new LocalAgentRunner(store, {
+    // Embedded PGlite (no DATABASE_URL) runs inside this process only, so a lock found at startup
+    // is a reply the previous process left unfinished: it is recovered at once.
+    exclusive: !input.config.databaseUrl,
     ...input.runner,
     retentionDays: input.config.chatRetentionDays,
   });

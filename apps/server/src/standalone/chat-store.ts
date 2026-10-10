@@ -29,6 +29,14 @@ export type BeginResult =
   | { status: "missing" }
   | { status: "duplicate" };
 
+/** Holders known to be dead, whose locks are recovered at once (see staleRuns). */
+export interface DeadLocks {
+  /** A previous process that used this instance id. */
+  instanceId?: string;
+  /** Every holder: this process is the only one that can use the database. */
+  all?: boolean;
+}
+
 export interface ClaimRow {
   claimed: boolean;
   owner: string | null;
@@ -306,16 +314,28 @@ export class ChatStore implements StandaloneThreadStore {
     };
   }
 
-  /** Undoes a claim whose run is not running (never began, or its start failed). */
+  /**
+   * Undoes a claim whose run is not running (never began, or its start failed). A thread row that
+   * has never run, has no runs and was not renamed or archived is deleted instead of kept unlocked,
+   * so refused runs leave no rows behind (/api/main-thread records the main thread again).
+   */
   async releaseClaim(threadId: string, runId: string): Promise<boolean> {
-    const rows = await this.db.sql(
-      `/* chat:release */ UPDATE chat_threads t SET ${unlock}
-      WHERE t.id=$1 AND t.run_id=$2
-        AND NOT EXISTS (SELECT 1 FROM chat_runs r WHERE r.run_id=$2 AND r.status='running')
-      RETURNING t.id`,
+    const rows = await this.db.sql<{ released: number }>(
+      `/* chat:release */ WITH gone AS (
+        DELETE FROM chat_threads t
+        WHERE t.id=$1 AND t.run_id=$2 AND t.last_run_at IS NULL AND t.name IS NULL AND NOT t.archived
+          AND NOT EXISTS (SELECT 1 FROM chat_runs r WHERE r.thread_id=t.id)
+        RETURNING t.id
+      ), kept AS (
+        UPDATE chat_threads t SET ${unlock}
+        WHERE t.id=$1 AND t.run_id=$2 AND NOT EXISTS (SELECT 1 FROM gone)
+          AND NOT EXISTS (SELECT 1 FROM chat_runs r WHERE r.run_id=$2 AND r.status='running')
+        RETURNING t.id
+      )
+      SELECT ((SELECT count(*) FROM gone) + (SELECT count(*) FROM kept))::int AS released`,
       [threadId, runId],
     );
-    return rows.length > 0;
+    return Boolean(rows[0]?.released);
   }
 
   /** Ids of every message already stored for the thread (closed runs). */
@@ -458,24 +478,26 @@ export class ChatStore implements StandaloneThreadStore {
   }
 
   /**
-   * Locks to recover: heartbeat older than staleAfterMs, every lock of deadInstance (a previous
-   * process with this instance id), and running runs no lock points at.
+   * Locks to recover: heartbeat older than staleAfterMs, every lock of dead.instanceId (a previous
+   * process with this instance id), every lock when dead.all (no other process can hold one), and
+   * running runs no lock points at. Locks of a dead holder are not guarded by their heartbeat.
    */
   async staleRuns(
     staleAfterMs: number,
-    deadInstance?: string,
+    dead: DeadLocks = {},
   ): Promise<{ threadId: string; runId: string; guarded: boolean }[]> {
     const rows = await this.db.sql<{ thread_id: string; run_id: string; guarded: boolean }>(
       `/* chat:stale */ SELECT id AS thread_id, run_id,
-        NOT ($2::text IS NOT NULL AND run_instance=$2) AS guarded
+        NOT ($3::boolean OR ($2::text IS NOT NULL AND run_instance=$2)) AS guarded
       FROM chat_threads
       WHERE run_id IS NOT NULL
-        AND (run_heartbeat_at < now() - $1${ms} OR ($2::text IS NOT NULL AND run_instance=$2))
+        AND ($3::boolean OR run_heartbeat_at < now() - $1${ms}
+          OR ($2::text IS NOT NULL AND run_instance=$2))
       UNION
       SELECT r.thread_id, r.run_id, false AS guarded FROM chat_runs r
       WHERE r.status='running' AND NOT EXISTS (
         SELECT 1 FROM chat_threads t WHERE t.id=r.thread_id AND t.run_id=r.run_id)`,
-      [staleAfterMs, deadInstance ?? null],
+      [staleAfterMs, dead.instanceId ?? null, dead.all === true],
     );
     return rows.map((row) => ({
       threadId: row.thread_id,
