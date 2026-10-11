@@ -20,14 +20,17 @@ import { type ServerType, serve } from "@hono/node-server";
 import { Observable, toArray } from "rxjs";
 import {
   ConversationTurnError,
+  historyUnavailable,
   replayedRunError,
   runConversationTurn,
   threadLocked,
 } from "../apps/mobile/src/conversation-run.ts";
 import { connectThread } from "../apps/mobile/src/local-thread.ts";
 import { createApp } from "../apps/server/src/app.ts";
-import { createStore, type Store } from "../apps/server/src/db.ts";
+import type { Store } from "../apps/server/src/db.ts";
 import type { StandaloneChat } from "../apps/server/src/standalone/index.ts";
+import { historyUnavailableMessage } from "../apps/server/src/standalone/runner.ts";
+import { createChatTestStore } from "./helpers/chat-database.ts";
 
 let db: Store, directory: string, token: string, runtimeUrl: string;
 let server: ServerType;
@@ -36,7 +39,7 @@ const cores: CopilotKitCore[] = [];
 
 before(async () => {
   directory = await mkdtemp(join(tmpdir(), "openmuse-standalone-client-"));
-  db = await createStore();
+  db = await createChatTestStore();
   const created = await createApp(db, {
     mode: "sample",
     port: 8787,
@@ -211,6 +214,36 @@ test("connecting again to a loaded thread (Retry, reopening it) does not double 
     assert.deepEqual(assistantText(reloaded.agent.messages), replies, `connect ${attempt + 1}`);
   }
   assert.deepEqual(reloaded.errors, []);
+});
+
+test("a reload whose history the server cannot read fails the load, and Retry loads it", async (t) => {
+  t.mock.method(console, "error", () => {}); // the server logs the failed read
+  const threadId = randomUUID();
+  const first = await client(threadId);
+  first.agent.addMessage({ id: randomUUID(), role: "user", content: "Show my calendar" });
+  await first.turn(() => first.core.runAgent({ agent: first.agent }));
+  const sent = first.agent.messages.map((message) => message.id);
+
+  const failing = t.mock.method(chat.runner.store, "connectHistory", async () => {
+    throw new Error("connection terminated");
+  });
+  const reloaded = await client(threadId);
+  // As chat.tsx hydrates: replayed RUN_ERRORs are ignored, this one fails the load (Retry shows).
+  await assert.rejects(
+    reloaded.turn(() => connectThread(reloaded.core, reloaded.agent, true), [replayedRunError]),
+    (error: unknown) =>
+      error instanceof ConversationTurnError &&
+      error.message === historyUnavailableMessage &&
+      (error.cause as Error & { code?: string }).code === historyUnavailable,
+  );
+  assert.equal(reloaded.agent.isRunning, false);
+  failing.mock.restore();
+  // Retry loading conversation.
+  await reloaded.turn(() => connectThread(reloaded.core, reloaded.agent, true), [replayedRunError]);
+  assert.deepEqual(
+    reloaded.agent.messages.map((message) => message.id),
+    sent,
+  );
 });
 
 /** An agent whose model fails after part of a reply. */

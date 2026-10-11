@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, afterEach, before, test } from "node:test";
+import { after, afterEach, before, type TestContext, test } from "node:test";
 import {
   AbstractAgent,
   type BaseEvent,
@@ -8,7 +8,7 @@ import {
   type RunAgentInput,
 } from "@ag-ui/client";
 import { Observable } from "rxjs";
-import { createStore, type Store } from "../apps/server/src/db.ts";
+import type { Store } from "../apps/server/src/db.ts";
 import { ChatStore } from "../apps/server/src/standalone/chat-store.ts";
 import {
   messagesFromEvents,
@@ -17,11 +17,16 @@ import {
 } from "../apps/server/src/standalone/events.ts";
 import { createStandaloneChat } from "../apps/server/src/standalone/index.ts";
 import {
+  historyUnavailableMessage,
   LocalAgentRunner,
   lockedMessage,
   persistenceFailedCode,
 } from "../apps/server/src/standalone/runner.ts";
-import type { LocalRunnerOptions } from "../apps/server/src/standalone/types.ts";
+import {
+  historyUnavailableCode,
+  type LocalRunnerOptions,
+} from "../apps/server/src/standalone/types.ts";
+import { createChatTestStore } from "./helpers/chat-database.ts";
 
 type Step = { event: Record<string, unknown> } | { gate: Promise<void> } | { fail: string };
 
@@ -203,6 +208,8 @@ const field = (event: BaseEvent | undefined, name: string) =>
 const types = (events: BaseEvent[]) => events.map((event) => event.type);
 const hasDelta = (events: BaseEvent[], delta: string) =>
   events.some((event) => field(event, "delta") === delta);
+const isTerminalEvent = (event: BaseEvent) =>
+  event.type === EventType.RUN_FINISHED || event.type === EventType.RUN_ERROR;
 
 let db: Store;
 let chats: ChatStore;
@@ -232,7 +239,7 @@ async function journalCount(runId: string) {
 }
 
 before(async () => {
-  db = await createStore();
+  db = await createChatTestStore();
   chats = await ChatStore.open(db);
 });
 
@@ -953,7 +960,7 @@ test("a run saved while a connect reads history is sent once, from the live run"
   let holdReads = false;
   let reads = 0;
   t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
-    if (holdReads && text.includes("chat:closed-runs")) {
+    if (holdReads && text.includes("chat:connect-history")) {
       reads++;
       await reading.promise;
     }
@@ -1211,7 +1218,7 @@ test("an unexpected failure while saving still ends the stream and leaves the ru
   assert.ok(Date.now() - closing < 1000, "close() has no run left to wait for");
 });
 
-test("a run that begins and is saved while a connect reads history is sent once", async (t) => {
+test("a run that begins and is saved while a connect reads history is sent once, from the live run", async (t) => {
   await chats.ensureThread("alice", "t-race-late", "default");
   const runner = make();
   const original = db.sql.bind(db);
@@ -1220,7 +1227,7 @@ test("a run that begins and is saved while a connect reads history is sent once"
   let reads = 0;
   let saved = false;
   t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
-    if (text.includes("/* chat:closed-runs */") && reads++ === 0) await reading.promise;
+    if (text.includes("/* chat:connect-history */") && reads++ === 0) await reading.promise;
     if (!text.includes("/* chat:close */")) return original(text, params);
     // The save commits, but the runner only sees it once `saving` opens (a pg Pool can answer the
     // history read in between).
@@ -1238,11 +1245,20 @@ test("a run that begins and is saved while a connect reads history is sent once"
     ),
   );
   await waitFor(() => saved, "the run's save");
-  // The history read now sees the saved run, which is still the live run in this process.
+  // The history read now sees the saved run. A run began during the read, so the connect reads
+  // again without that run, which is still live in this process, and follows it until it is saved.
   reading.open();
-  const events = await within(connection.finished, "the connect to end");
+  await waitFor(
+    () => reads > 1 && hasDelta(connection.events, "lo"),
+    "the connect to follow the run",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(connection.state.done, false, "the connect ends only once the run is saved");
+  assert.ok(!connection.events.some(isTerminalEvent), "the terminal event waits for the save");
   saving.open();
+  const events = await within(connection.finished, "the connect to end");
   assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
   assert.equal(events.filter((event) => event.type === EventType.RUN_STARTED).length, 1);
   assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
     { id: "u1", role: "user", content: "Hi" },
@@ -1275,4 +1291,376 @@ test("a run whose runId runs on another thread is refused and releases its own c
   assert.equal(await chats.isLocked("t-dup-a"), true);
   pause.open();
   assert.equal((await first.finished).at(-1)?.type, EventType.RUN_FINISHED);
+});
+
+/**
+ * Holds the rows of the thread's first connect-history read until `answer` opens. The read itself
+ * runs at once (its snapshot is taken then), as a pg Pool connection that answers slowly would.
+ */
+function holdFirstHistoryAnswer(t: TestContext) {
+  const original = db.sql.bind(db);
+  const answer = gate();
+  const state = { reads: 0, read: false };
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (!text.includes("/* chat:connect-history */") || state.reads++ > 0)
+      return original(text, params);
+    const rows = await original(text, params);
+    state.read = true;
+    await answer.promise;
+    return rows;
+  });
+  return { answer, state };
+}
+
+test("a run that begins and ends while a connect's earlier snapshot is answered is still sent", async (t) => {
+  await chats.ensureThread("alice", "t-snapshot", "default");
+  const runner = make();
+  const { answer, state } = holdFirstHistoryAnswer(t);
+  // No run is live: the connect captures none, and its read sees the thread before the run.
+  const connection = collect(runner.connect({ threadId: "t-snapshot" }));
+  await waitFor(() => state.read, "history read");
+  const run = collect(
+    runner.run(
+      request(replyAgent("a1", ["Hel", "lo"]), "t-snapshot", "snap-1", [user("u1", "Hi")]),
+    ),
+  );
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal((await runRow("snap-1"))?.status, "finished");
+  // The run has been saved and has left the runner by the time the old snapshot arrives.
+  answer.open();
+  const events = await within(connection.finished, "the connect to end");
+  assert.equal(state.reads, 2, "the connect read the history again");
+  assert.equal(events.filter((event) => event.type === EventType.RUN_STARTED).length, 1);
+  assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Hello" },
+  ]);
+});
+
+test("a connect follows the run that succeeded its captured run during the history read", async (t) => {
+  await chats.ensureThread("alice", "t-succeed", "default");
+  const runner = make();
+  const original = db.sql.bind(db);
+  const reading = gate();
+  let reads = 0;
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (text.includes("/* chat:connect-history */") && reads++ === 0) await reading.promise;
+    return original(text, params);
+  });
+  const firstPause = gate();
+  const first = collect(
+    runner.run(
+      request(replyAgent("a1", ["one", "two"], firstPause.promise), "t-succeed", "succ-1", [
+        user("u1", "Hi"),
+      ]),
+    ),
+  );
+  await waitFor(() => hasDelta(first.events, "one"), "first run");
+  // The connect captures the first run; its history read waits.
+  const connection = collect(runner.connect({ threadId: "t-succeed" }));
+  await waitFor(() => reads > 0, "history read");
+  firstPause.open();
+  await first.finished;
+  // A message queued on another device starts the next run at once.
+  assert.deepEqual(
+    await runner.claim({
+      owner: "alice",
+      threadId: "t-succeed",
+      agentId: "default",
+      runId: "succ-2",
+    }),
+    { ok: true },
+  );
+  const secondPause = gate();
+  const second = collect(
+    runner.run(
+      request(replyAgent("a2", ["three", "four"], secondPause.promise), "t-succeed", "succ-2", [
+        user("u1", "Hi"),
+        { id: "a1", role: "assistant", content: "onetwo" },
+        user("u2", "Again"),
+      ]),
+    ),
+  );
+  await waitFor(() => hasDelta(second.events, "three"), "second run");
+  reading.open();
+  await waitFor(() => hasDelta(connection.events, "three"), "the connect to follow the second run");
+  assert.equal(connection.state.done, false, "the reply in progress is still followed");
+  secondPause.open();
+  assert.equal((await second.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  const events = await within(connection.finished, "the connect to end");
+  assert.equal(events.filter((event) => event.type === EventType.RUN_STARTED).length, 2);
+  assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "onetwo" },
+    { id: "u2", role: "user", content: "Again" },
+    { id: "a2", role: "assistant", content: "threefour" },
+  ]);
+});
+
+test("another process's reply is read in the same snapshot as the history, so a save between them loses nothing", async (t) => {
+  await chats.ensureThread("alice", "t-elsewhere", "default");
+  const holder = make();
+  const reader = make();
+  await collect(
+    holder.run(
+      request(replyAgent("a0", ["Earlier"]), "t-elsewhere", "else-0", [user("u0", "First")]),
+    ),
+  ).finished;
+  const pause = gate();
+  const run = collect(
+    holder.run(
+      request(replyAgent("a1", ["part", "ial"], pause.promise), "t-elsewhere", "else-1", [
+        user("u0", "First"),
+        { id: "a0", role: "assistant", content: "Earlier" },
+        user("u1", "Then"),
+      ]),
+    ),
+  );
+  await waitFor(async () => (await journalCount("else-1")) >= 3, "journal");
+  const { answer, state } = holdFirstHistoryAnswer(t);
+  const connection = collect(reader.connect({ threadId: "t-elsewhere" }));
+  await waitFor(() => state.read, "history read");
+  // The other process saves its reply after the snapshot was taken.
+  pause.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal((await runRow("else-1"))?.status, "finished");
+  answer.open();
+  const events = await within(connection.finished, "the connect to end");
+  assert.equal(state.reads, 1);
+  // The snapshot held the saved first reply and the second one's journal: both are sent.
+  assert.deepEqual(types(events), [
+    EventType.RUN_STARTED,
+    EventType.TEXT_MESSAGE_START,
+    EventType.TEXT_MESSAGE_CONTENT,
+    EventType.TEXT_MESSAGE_END,
+    EventType.RUN_FINISHED,
+    EventType.RUN_STARTED,
+    EventType.TEXT_MESSAGE_START,
+    EventType.TEXT_MESSAGE_CONTENT,
+  ]);
+  assert.equal(field(events[2], "delta"), "Earlier");
+  assert.equal(field(events[7], "delta"), "part");
+});
+
+/** The single event a connect sends when it cannot read the thread's history. */
+const historyUnavailable = [
+  { type: EventType.RUN_ERROR, message: historyUnavailableMessage, code: historyUnavailableCode },
+];
+
+test("a connect fails rather than send a wrong history while replies keep starting during its reads", async (t) => {
+  t.mock.method(console, "error", () => {});
+  await chats.ensureThread("alice", "t-restless", "default");
+  const runner = make();
+  runner.historyReadLimit = 3;
+  const original = db.sql.bind(db);
+  let reads = 0;
+  let restless = true;
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (restless && text.includes("/* chat:connect-history */")) {
+      // Another reply runs on the thread during every read.
+      const n = ++reads;
+      await collect(
+        runner.run(
+          request(replyAgent(`a${n}`, [`reply ${n}`]), "t-restless", `rest-${n}`, [
+            user(`u${n}`, `Message ${n}`),
+          ]),
+        ),
+      ).finished;
+    }
+    return original(text, params);
+  });
+  // The runtime would end the SSE response normally on a stream error, so the connect ends with a
+  // RUN_ERROR the app reports as a failed load (with Retry) instead.
+  assert.deepEqual(
+    await within(collect(runner.connect({ threadId: "t-restless" })).finished, "the connect"),
+    historyUnavailable,
+  );
+  assert.equal(reads, 3);
+  // Once the thread is quiet, a connect (the app's Retry) sends every reply once.
+  restless = false;
+  const events = await within(
+    collect(runner.connect({ threadId: "t-restless" })).finished,
+    "the retried connect",
+  );
+  assert.deepEqual(
+    toWireMessages(messagesFromEvents(events)).map((message) => message.id),
+    ["u1", "a1", "u2", "a2", "u3", "a3"],
+  );
+});
+
+test("a connect whose history cannot be read ends with history_unavailable", async (t) => {
+  t.mock.method(console, "error", () => {});
+  await chats.ensureThread("alice", "t-no-history", "default");
+  const runner = make();
+  await collect(
+    runner.run(
+      request(replyAgent("a1", ["Saved"]), "t-no-history", "nohist-1", [user("u1", "Hi")]),
+    ),
+  ).finished;
+  const original = db.sql.bind(db);
+  const failing = t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    if (text.includes("/* chat:connect-history */")) throw new Error("connection terminated");
+    return original(text, params);
+  });
+  assert.deepEqual(
+    await within(collect(runner.connect({ threadId: "t-no-history" })).finished, "the connect"),
+    historyUnavailable,
+  );
+  failing.mock.restore();
+  const events = await within(
+    collect(runner.connect({ threadId: "t-no-history" })).finished,
+    "the retried connect",
+  );
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Saved" },
+  ]);
+});
+
+test("a run begun in the database but not yet registered when a connect's read returns is followed", async (t) => {
+  await chats.ensureThread("alice", "t-registering", "default");
+  const runner = make();
+  const original = db.sql.bind(db);
+  const answer = gate();
+  let begun = false;
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    const rows = await original(text, params);
+    if (text.includes("/* chat:begin */")) {
+      // The run is begun in the database; its answer reaches the runner only once `answer` opens
+      // (a pg Pool connection that answers slowly).
+      begun = true;
+      await answer.promise;
+    }
+    return rows;
+  });
+  const pause = gate();
+  const run = collect(
+    runner.run(
+      request(replyAgent("a1", ["Hel", "lo"], pause.promise), "t-registering", "reg-1", [
+        user("u1", "Hi"),
+      ]),
+    ),
+  );
+  await waitFor(() => begun, "the run to begin in the database");
+  // The connect's read sees the run as running with an empty journal; the runner has not
+  // registered it yet, so the connect waits for it instead of ending with nothing.
+  const connection = collect(runner.connect({ threadId: "t-registering" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(connection.state.done, false, "the connect waits for the run being begun");
+  answer.open();
+  await waitFor(() => hasDelta(connection.events, "Hel"), "the connect to follow the run");
+  assert.equal(connection.state.done, false, "the reply in progress is followed");
+  pause.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  const events = await within(connection.finished, "the connect to end");
+  assert.equal(events.filter((event) => event.type === EventType.RUN_STARTED).length, 1);
+  assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
+  assert.deepEqual(toWireMessages(messagesFromEvents(events)), [
+    { id: "u1", role: "user", content: "Hi" },
+    { id: "a1", role: "assistant", content: "Hello" },
+  ]);
+});
+
+test("claim takes over a dead process's stale lock after saving its journal", async () => {
+  await chats.ensureThread("alice", "t-takeover", "default");
+  // The dead process never starts its timers, so nothing refreshes its lock.
+  const dead = make();
+  const pause = gate();
+  const run = collect(
+    dead.run(
+      request(replyAgent("a1", ["part", "ial"], pause.promise), "t-takeover", "take-1", [
+        user("u1", "Tell me"),
+      ]),
+    ),
+  );
+  await waitFor(async () => (await journalCount("take-1")) >= 3, "journal");
+  const next = make({ sweepMs: 60_000 });
+  const claim = (runId: string) =>
+    next.claim({ owner: "alice", threadId: "t-takeover", agentId: "default", runId });
+  assert.deepEqual(await claim("take-2"), { ok: false, reason: "locked" }, "a fresh lock holds");
+  await db.sql(
+    "UPDATE chat_threads SET run_heartbeat_at = now() - interval '1 hour' WHERE id='t-takeover'",
+  );
+  assert.deepEqual(await claim("take-2"), { ok: true });
+  const row = await runRow("take-1");
+  assert.equal(row?.status, "interrupted");
+  assert.equal(await journalCount("take-1"), 0);
+  assert.deepEqual(toWireMessages(messagesFromEvents(row?.events ?? [])), [
+    { id: "u1", role: "user", content: "Tell me" },
+    { id: "a1", role: "assistant", content: "part" },
+  ]);
+  await next.release("t-takeover", "take-2");
+  assert.equal(await chats.isLocked("t-takeover"), false);
+  pause.open();
+  assert.equal(field((await run.finished).at(-1), "code"), persistenceFailedCode);
+});
+
+test("the sweep leaves a lock alone when its holder heartbeats after the lock was found stale", async (t) => {
+  await chats.ensureThread("alice", "t-guard", "default");
+  const holder = make();
+  const pause = gate();
+  const run = collect(
+    holder.run(request(replyAgent("a1", ["Hel", "lo"], pause.promise), "t-guard", "guard-1")),
+  );
+  await waitFor(() => hasDelta(run.events, "Hel"), "streaming");
+  await db.sql(
+    "UPDATE chat_threads SET run_heartbeat_at = now() - interval '1 hour' WHERE id='t-guard'",
+  );
+  const original = db.sql.bind(db);
+  t.mock.method(db, "sql", async (text: string, params?: unknown[]) => {
+    const rows = await original(text, params);
+    // The holder's heartbeat lands between the sweep's scan and its recovery.
+    if (text.includes("/* chat:stale */"))
+      await original("UPDATE chat_threads SET run_heartbeat_at = now() WHERE id='t-guard'");
+    return rows;
+  });
+  const sweeper = make();
+  await sweeper.sweep();
+  assert.equal((await runRow("guard-1"))?.status, "running");
+  assert.equal(await chats.isLocked("t-guard"), true);
+  pause.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+  assert.equal((await runRow("guard-1"))?.status, "finished");
+});
+
+test("close() releases this instance's claims whose runs never began, and only those", async () => {
+  const runner = make();
+  const other = make();
+  const claim = (target: LocalAgentRunner, threadId: string, runId: string) =>
+    target.claim({ owner: "alice", threadId, agentId: "default", runId });
+  assert.deepEqual(await claim(runner, "t-shut-mine", "shut-1"), { ok: true });
+  assert.deepEqual(await claim(other, "t-shut-other", "shut-2"), { ok: true });
+  await runner.close();
+  assert.equal(await chats.isLocked("t-shut-mine"), false);
+  assert.equal(await chats.isLocked("t-shut-other"), true);
+  await other.release("t-shut-other", "shut-2");
+});
+
+test("text with unpaired surrogates or NUL characters is saved with U+FFFD instead of failing", async () => {
+  await chats.ensureThread("alice", "t-unpaired", "default");
+  const runner = make();
+  // A reply cut in the middle of an emoji, and a message carrying stray characters.
+  const events = await within(
+    collect(
+      runner.run(
+        request(replyAgent("a1", ["Cut at the limit: ", "\uD83D"]), "t-unpaired", "unpaired-1", [
+          user("u1", "Name: \uDE00 and \u0000 😀"),
+        ]),
+      ),
+    ).finished,
+    "the run",
+  );
+  assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);
+  const row = await runRow("unpaired-1");
+  assert.equal(row?.status, "finished");
+  assert.equal(await chats.isLocked("t-unpaired"), false);
+  const expected = [
+    { id: "u1", role: "user", content: "Name: � and � 😀" },
+    { id: "a1", role: "assistant", content: "Cut at the limit: �" },
+  ];
+  assert.deepEqual(toWireMessages(messagesFromEvents(row?.events ?? [])), expected);
+  const replay = await collect(runner.connect({ threadId: "t-unpaired" })).finished;
+  assert.deepEqual(toWireMessages(messagesFromEvents(replay)), expected);
 });

@@ -21,7 +21,7 @@ import {
 } from "@copilotkit/runtime/v2";
 import { type Observable, ReplaySubject } from "rxjs";
 import { backgroundFailure } from "../log.ts";
-import type { BeginResult, ChatStore, DeadLocks, RunStatus } from "./chat-store.ts";
+import type { BeginResult, ChatStore, ConnectHistory, DeadLocks, RunStatus } from "./chat-store.ts";
 import {
   compactLeniently,
   compactRun,
@@ -33,6 +33,7 @@ import {
 } from "./events.ts";
 import {
   type ClaimResult,
+  historyUnavailableCode,
   type LocalRunnerOptions,
   type StandaloneRunControl,
   threadLockedCode,
@@ -45,6 +46,7 @@ export const persistenceFailedCode = "persistence_failed";
 const restartingMessage = "The server is restarting.";
 const crashedMessage = "The server stopped before this reply finished.";
 const startFailedMessage = "This conversation could not be started. Try again.";
+export const historyUnavailableMessage = "This conversation could not be loaded. Try again.";
 const journalBatch = 64;
 
 interface ActiveRun {
@@ -68,6 +70,19 @@ interface ActiveRun {
   finalized: boolean;
   done: Promise<void>;
   markDone: () => void;
+}
+
+/** Connects reading a thread's history, and the begin() calls on the thread that ended meanwhile. */
+interface HistoryWatch {
+  readers: number;
+  begins: number;
+}
+
+/** begin() calls in progress on a thread; `idle` resolves when the last one ends. */
+interface BeginWindow {
+  open: number;
+  idle: Promise<void>;
+  close: () => void;
 }
 
 /** A claim this process took whose run has not begun yet. */
@@ -102,12 +117,16 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
   closeRetryDelaysMs = [500, 1000, 2000];
   /** Longest wait for one shutdown step, and for a connect waiting on a claimed run to begin. */
   closeCapMs = 5000;
+  /** History reads one connect makes at most while runs keep beginning on its thread. */
+  historyReadLimit = 10;
   private readonly heartbeatMs: number;
   private readonly staleAfterMs: number;
   private readonly sweepMs: number;
   private readonly flushMs: number;
   private readonly active = new Map<string, ActiveRun>();
   private readonly claimed = new Map<string, PendingClaim>();
+  private readonly watches = new Map<string, HistoryWatch>();
+  private readonly beginning = new Map<string, BeginWindow>();
   private timers: ReturnType<typeof setInterval>[] = [];
   private started = false;
   private closed = false;
@@ -145,7 +164,11 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     const subject = new ReplaySubject<BaseEvent>(Infinity);
     void this.replay(request.threadId, subject).catch((error) => {
       backgroundFailure("standalone chat connect", error);
-      subject.error(error);
+      // The runtime ends the SSE response normally when this stream errors, so the app would take
+      // what it received (often nothing) for the whole conversation. A RUN_ERROR with this code
+      // makes the app's load fail instead, which offers Retry.
+      subject.next(runError(historyUnavailableMessage, historyUnavailableCode));
+      subject.complete();
     });
     return subject.asObservable();
   }
@@ -324,8 +347,44 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     await this.finalize(run, interruption);
   }
 
-  /** Takes the thread for the run and registers it, or ends the stream with a RUN_ERROR. */
+  /**
+   * Takes the thread for the run and registers it, or ends the stream with a RUN_ERROR. While it
+   * runs, the run may be begun in the database but not yet in `active`; a connect reading the
+   * thread's history meanwhile reads it again once this ends (see readHistory).
+   */
   private async begin(
+    request: AgentRunnerRunRequest,
+    subject: ReplaySubject<BaseEvent>,
+  ): Promise<Begun | undefined> {
+    const { threadId } = request;
+    let window = this.beginning.get(threadId);
+    if (!window) {
+      let idle = () => {};
+      const opened: BeginWindow = {
+        open: 0,
+        idle: new Promise<void>((resolve) => {
+          idle = resolve;
+        }),
+        close: () => {
+          if (--opened.open > 0) return;
+          this.beginning.delete(threadId);
+          idle();
+        },
+      };
+      window = opened;
+      this.beginning.set(threadId, window);
+    }
+    window.open++;
+    try {
+      return await this.takeThread(request, subject);
+    } finally {
+      window.close();
+      const watch = this.watches.get(threadId);
+      if (watch) watch.begins++;
+    }
+  }
+
+  private async takeThread(
     request: AgentRunnerRunRequest,
     subject: ReplaySubject<BaseEvent>,
   ): Promise<Begun | undefined> {
@@ -575,16 +634,10 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     // connect tails it instead of finding the thread idle.
     const pending = this.claimed.get(threadId);
     if (pending) await Promise.race([pending.begun, delay(this.closeCapMs)]);
-    // Capture the live run before the history read: it is excluded from that read, and its
-    // ReplaySubject replays it from the start, so nothing is lost or sent twice.
-    const captured = this.active.get(threadId);
-    const runs = await this.store.closedRunEvents(threadId, captured?.runId);
-    for (const event of compactLeniently(runs.flatMap(replayedRun))) subject.next(event);
-    // A run that began after the capture is tailed too, unless the history read already saw it.
-    const live = captured ?? this.active.get(threadId);
-    const stored = (run: ActiveRun) =>
-      runs.some((events) => events.some((e) => (e as { runId?: unknown }).runId === run.runId));
-    if (live && (live === captured || !stored(live))) {
+    const { live, history } = await this.readHistory(threadId);
+    for (const event of compactLeniently(history.closed.flatMap(replayedRun))) subject.next(event);
+    if (live) {
+      // Its ReplaySubject replays it from the start and completes once it is saved.
       live.subject.subscribe({
         next: (event) => subject.next(event),
         complete: () => subject.complete(),
@@ -592,10 +645,43 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
       });
       return;
     }
-    // A run held by another process: send what its journal holds (no cross-process live tail).
-    const journal = live ? null : await this.store.runningJournal(threadId);
-    if (journal) for (const event of compactRun(journal)) subject.next(event);
+    // A run held by another process: send what its journal held (no cross-process live tail).
+    if (history.running) for (const event of compactRun(history.running)) subject.next(event);
     subject.complete();
+  }
+
+  /**
+   * The thread's history and the local run to tail after it, consistent with each other. The live
+   * run is captured before the read, which leaves it out. The read agrees with `active` unless a
+   * run began on the thread during it: a pg Pool can answer from a snapshot taken before that run
+   * was saved while the run has already left `active` (it would be missing), or after the run was
+   * begun in the database but before it entered `active` (only its empty journal would be sent),
+   * and a run that succeeded the captured one is left out as running. So a read is used only if no
+   * begin() on the thread ended during it and none is still in progress (that one is waited for);
+   * otherwise it is made again with the run that is live now. Runs on a thread follow one another,
+   * so the reads end once no run starts within one read. At historyReadLimit the connect fails
+   * (the app offers Retry) rather than send a wrong history.
+   */
+  private async readHistory(
+    threadId: string,
+  ): Promise<{ live: ActiveRun | undefined; history: ConnectHistory }> {
+    const watch = this.watches.get(threadId) ?? { readers: 0, begins: 0 };
+    this.watches.set(threadId, watch);
+    watch.readers++;
+    try {
+      for (let read = 1; ; read++) {
+        const begins = watch.begins;
+        const live = this.active.get(threadId);
+        const history = await this.store.connectHistory(threadId, live?.runId);
+        const beginning = this.beginning.get(threadId);
+        if (watch.begins === begins && !beginning) return { live, history };
+        if (read >= this.historyReadLimit)
+          throw new Error("Replies kept starting while this conversation was loaded.");
+        if (beginning) await Promise.race([beginning.idle, delay(this.closeCapMs)]);
+      }
+    } finally {
+      if (--watch.readers === 0) this.watches.delete(threadId);
+    }
   }
 
   // ---- Background ----

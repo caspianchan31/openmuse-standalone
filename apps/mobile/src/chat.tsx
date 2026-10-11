@@ -38,7 +38,7 @@ import {
 import { DesktopToolCard } from "./desktop-tool-card";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
-import { connectThread } from "./local-thread";
+import { connectThread, lockRefusalAgent } from "./local-thread";
 import { MailToolCard } from "./mail-tool-card";
 import { SearchToolCard } from "./search-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
@@ -350,8 +350,8 @@ export function ChatScreen({
           () => copilotkit.runAgent({ agent }),
           (onError) => copilotkit.subscribe({ onError }),
           [],
-          // Standalone: a queued message refused by a thread lock is held below, not reported.
-          message ? agent : undefined,
+          // Standalone: a queued message refused by a local thread lock is held below, not reported.
+          lockRefusalAgent(agent, Boolean(message), localThreads),
         );
         await Promise.all([refresh(), refreshAgent()]);
       } catch (e) {
@@ -385,6 +385,7 @@ export function ChatScreen({
       copilotkit,
       isReady,
       loaded,
+      localThreads,
       syncing,
       refresh,
       refreshAgent,

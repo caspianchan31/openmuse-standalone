@@ -48,6 +48,12 @@ export type DeleteResult = "deleted" | "not_found" | "running";
 /** Error code the client already understands as "thread busy, hold the message". */
 export const threadLockedCode = "agent_thread_locked";
 
+/**
+ * RUN_ERROR code ending a connect whose history could not be read: the app fails the load (and
+ * offers Retry) instead of taking what it received for the whole conversation.
+ */
+export const historyUnavailableCode = "history_unavailable";
+
 /** Owner-scoped thread storage used by the thread routes. Implemented by ChatStore. */
 export interface StandaloneThreadStore {
   /** Create the thread for owner if absent. "forbidden" when another owner holds the id. */

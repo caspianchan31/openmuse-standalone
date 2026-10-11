@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { type BaseEvent, EventType } from "@ag-ui/client";
-import { createStore, type Store } from "../apps/server/src/db.ts";
-import { ChatStore, CursorError } from "../apps/server/src/standalone/chat-store.ts";
+import type { Store } from "../apps/server/src/db.ts";
+import {
+  ChatStore,
+  CursorError,
+  storableText,
+  toJsonb,
+} from "../apps/server/src/standalone/chat-store.ts";
 import {
   messageIdsOf,
   messagesFromEvents,
@@ -10,12 +15,13 @@ import {
   stateFromEvents,
   toWireMessages,
 } from "../apps/server/src/standalone/events.ts";
+import { createChatTestStore } from "./helpers/chat-database.ts";
 
 let db: Store;
 let chats: ChatStore;
 
 before(async () => {
-  db = await createStore();
+  db = await createChatTestStore();
   chats = await ChatStore.open(db);
 });
 
@@ -157,6 +163,23 @@ test("list cursors do not depend on the database's DateStyle", async (t) => {
   await db.sql(
     "UPDATE chat_threads SET last_run_at=(SELECT last_run_at FROM chat_threads WHERE id='style-a') WHERE id='style-b'",
   );
+  // The stored instants, to the millisecond (as a JavaScript Date holds them).
+  const instants = new Map(
+    (
+      await db.sql<{ id: string; created: string; run: string }>(
+        `SELECT id, floor(extract(epoch FROM created_at) * 1000)::bigint::text AS created,
+          floor(extract(epoch FROM last_run_at) * 1000)::bigint::text AS run
+        FROM chat_threads WHERE owner=$1`,
+        [owner],
+      )
+    ).map((row) => [
+      row.id,
+      {
+        createdAt: new Date(Number(row.created)).toISOString(),
+        lastRunAt: new Date(Number(row.run)).toISOString(),
+      },
+    ]),
+  );
   t.after(() => db.sql("SET DateStyle = 'ISO, MDY'"));
   for (const style of ["ISO, MDY", "SQL, DMY", "Postgres, MDY", "German"]) {
     await db.sql(`SET DateStyle = '${style}'`);
@@ -164,12 +187,39 @@ test("list cursors do not depend on the database's DateStyle", async (t) => {
     let cursor: string | undefined;
     for (let page = 0; page < 5; page++) {
       const result = await chats.listThreads(owner, { agentId: "default", limit: 1, cursor });
-      seen.push(...result.threads.map((thread) => thread.id));
+      for (const thread of result.threads) {
+        seen.push(thread.id);
+        assert.deepEqual(
+          { createdAt: thread.createdAt, lastRunAt: thread.lastRunAt },
+          instants.get(thread.id),
+          `${style}: ${thread.id}`,
+        );
+      }
       if (!result.nextCursor) break;
       cursor = result.nextCursor;
     }
     assert.deepEqual(seen, ["style-c", "style-b", "style-a"], style);
+    const renamed = await chats.updateThread(owner, "style-a", "default", { name: style });
+    assert.equal(renamed?.lastRunAt, instants.get("style-a")?.lastRunAt, style);
   }
+});
+
+test("stored text never carries NUL characters or unpaired surrogates", async () => {
+  const value = {
+    "key \uD800": ["\uDC00 low", "pair \uD83D\uDE00 kept", "nul \u0000"],
+    nested: { "\u0000": "high at the end \uD83D" },
+  };
+  const rows = await db.sql<{ value: unknown }>("SELECT $1::jsonb AS value", [toJsonb(value)]);
+  assert.deepEqual(rows[0]?.value, {
+    "key \uFFFD": ["\uFFFD low", "pair \uD83D\uDE00 kept", "nul \uFFFD"],
+    nested: { "\uFFFD": "high at the end \uFFFD" },
+  });
+  assert.equal(storableText("plain \uD83D\uDE00"), "plain \uD83D\uDE00");
+  await chats.ensureThread("alice", "t-odd-name", "default");
+  const renamed = await chats.updateThread("alice", "t-odd-name", "default", {
+    name: "a\u0000b\uD83D",
+  });
+  assert.equal(renamed?.name, "a\uFFFDb\uFFFD");
 });
 
 test("listThreads rejects bad cursors with CursorError", async () => {

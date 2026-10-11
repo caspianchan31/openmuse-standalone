@@ -6,6 +6,19 @@ export const replayedRunError = "agent_run_error_event";
 /** The thread is busy with another run, so the server refused this one before starting it. */
 export const threadLocked = "agent_thread_locked";
 
+/**
+ * Standalone: the server (local mode) could not read the thread's history for a connect. It ends
+ * the replay with a RUN_ERROR carrying this code, which CopilotKit copies onto the reported error.
+ * It is a failure of this load, not a replayed past failure, so ignoring replayed errors keeps it.
+ */
+export const historyUnavailable = "history_unavailable";
+
+function isHistoryUnavailable(error: unknown) {
+  return (
+    error instanceof Error && (error as Error & { code?: unknown }).code === historyUnavailable
+  );
+}
+
 /** CopilotKit reports a lock as agent_thread_locked, then again as agent_run_failed. */
 export function isThreadLocked(event: Pick<RunError, "error" | "code">) {
   return (
@@ -117,7 +130,7 @@ export async function runConversationTurn(
   let failure: ConversationTurnError | undefined;
   const subscription = subscribe((event) => {
     if (event.context?.agentId && event.context.agentId !== agentId) return;
-    if (event.code && ignore.includes(event.code)) return;
+    if (event.code && ignore.includes(event.code) && !isHistoryUnavailable(event.error)) return;
     const error = event.error instanceof Error ? event.error : new Error(String(event.error));
     // The first report is the specific one; CopilotKit follows it with a generic agent_run_failed.
     failure ??= new ConversationTurnError(error, isThreadLocked(event) ? threadLocked : event.code);

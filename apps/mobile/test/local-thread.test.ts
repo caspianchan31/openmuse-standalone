@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { connectThread } from "../src/local-thread.ts";
+import { connectThread, lockRefusalAgent } from "../src/local-thread.ts";
 
 function fakeAgent() {
   const calls: string[] = [];
@@ -29,4 +29,12 @@ test("local threads clear the agent before every connect; Intelligence threads d
   const cloud = fakeAgent();
   assert.equal(await connectThread(cloud.copilotkit, cloud.agent, false), "connected");
   assert.deepEqual(cloud.calls, ["connect"]);
+});
+
+test("only a queued turn on a local thread claims lock refusals; Intelligence keeps upstream's", () => {
+  const agent = { id: "agent" };
+  assert.equal(lockRefusalAgent(agent, true, true), agent);
+  assert.equal(lockRefusalAgent(agent, true, false), undefined);
+  assert.equal(lockRefusalAgent(agent, false, true), undefined);
+  assert.equal(lockRefusalAgent(agent, false, false), undefined);
 });

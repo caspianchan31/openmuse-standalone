@@ -38,6 +38,12 @@ export interface DeadLocks {
   all?: boolean;
 }
 
+/** See ChatStore.connectHistory. */
+export interface ConnectHistory {
+  closed: BaseEvent[][];
+  running: BaseEvent[] | null;
+}
+
 export interface ClaimRow {
   claimed: boolean;
   owner: string | null;
@@ -89,7 +95,10 @@ CREATE TABLE IF NOT EXISTS chat_events(
 );
 END $$`;
 
-const threadColumns = "id, name, agent_id, archived, created_at, updated_at, last_run_at";
+// Timestamps as ISO text built here: node-pg cannot parse timestamptz output in a non-ISO DateStyle.
+const isoText = (column: string) =>
+  `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS ${column}`;
+const threadColumns = `id, name, agent_id, archived, ${isoText("created_at")}, ${isoText("updated_at")}, ${isoText("last_run_at")}`;
 const ms = "::double precision * interval '1 millisecond'";
 const unlock =
   "run_id=NULL, run_instance=NULL, run_claimed_at=NULL, run_heartbeat_at=NULL, stop_requested=false";
@@ -99,13 +108,13 @@ interface ThreadRow {
   name: string | null;
   agent_id: string;
   archived: boolean;
-  created_at: unknown;
-  updated_at: unknown;
-  last_run_at: unknown;
+  created_at: string;
+  updated_at: string;
+  last_run_at: string | null;
 }
 
-function iso(value: unknown): string {
-  return (value instanceof Date ? value : new Date(String(value))).toISOString();
+function iso(value: string): string {
+  return new Date(value).toISOString();
 }
 
 function toRecord(row: ThreadRow): ThreadRecord {
@@ -122,11 +131,29 @@ function toRecord(row: ThreadRow): ThreadRecord {
   };
 }
 
-/** jsonb text for a value; NUL characters (rejected by Postgres) become U+FFFD. */
+// Unpaired UTF-16 surrogates (as in a reply cut in the middle of an emoji): jsonb rejects them.
+// String.prototype.toWellFormed, but the project targets ES2023 (as wellFormed in
+// packages/integrations/src/google.ts).
+const unpaired = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const unpairedAll = new RegExp(unpaired.source, "g");
+
+/** The text with NUL characters (Postgres rejects them) and unpaired surrogates as U+FFFD. */
+export function storableText(text: string): string {
+  const withoutNul = text.includes("\u0000") ? text.replaceAll("\u0000", "\uFFFD") : text;
+  return unpaired.test(withoutNul) ? withoutNul.replace(unpairedAll, "\uFFFD") : withoutNul;
+}
+
+/** jsonb text for a value; its strings and keys are made storable (see storableText). */
 export function toJsonb(value: unknown): string {
-  return JSON.stringify(value, (_key, item) =>
-    typeof item === "string" && item.includes("\u0000") ? item.replaceAll("\u0000", "�") : item,
-  );
+  return JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === "string") return storableText(item);
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return item;
+    const keys = Object.keys(item);
+    if (keys.every((key) => storableText(key) === key)) return item;
+    return Object.fromEntries(
+      keys.map((key) => [storableText(key), (item as Record<string, unknown>)[key]]),
+    );
+  });
 }
 
 /** A list cursor's sort key: microseconds since 1970 (independent of the server's DateStyle). */
@@ -231,7 +258,7 @@ export class ChatStore implements StandaloneThreadStore {
     agentId: string,
     patch: ThreadPatch,
   ): Promise<ThreadRecord | null> {
-    const name = patch.name ?? null;
+    const name = patch.name === undefined ? null : storableText(patch.name);
     const archived = patch.archived ?? null;
     const rows = await this.db.sql<ThreadRow>(
       `/* chat:update */ UPDATE chat_threads SET name=coalesce($4::text, name),
@@ -529,28 +556,33 @@ export class ChatStore implements StandaloneThreadStore {
     return row ? { started: row.events[0] ?? null, journal: row.journal } : null;
   }
 
-  /** The journal of the thread's running run (whichever instance holds it), or null. */
-  async runningJournal(threadId: string): Promise<BaseEvent[] | null> {
-    const rows = await this.db.sql<{ journal: BaseEvent[] }>(
-      `/* chat:running-journal */ SELECT coalesce((
+  /**
+   * What a connect replays, read in ONE statement so both parts come from the same snapshot: the
+   * thread's closed runs (compacted per run, oldest first) and the journal of its running run
+   * (whichever instance holds it). excludeRunId (the live run the caller tails) is left out of both.
+   * Two statements could miss a run that another process saves between them.
+   */
+  async connectHistory(threadId: string, excludeRunId?: string): Promise<ConnectHistory> {
+    const rows = await this.db.sql<{ events: BaseEvent[] | null; journal: BaseEvent[] | null }>(
+      `/* chat:connect-history */ SELECT r.events, NULL::jsonb AS journal, r.position
+      FROM chat_runs r
+      WHERE r.thread_id=$1 AND r.status<>'running' AND ($2::text IS NULL OR r.run_id<>$2)
+      UNION ALL
+      SELECT NULL, coalesce((
         SELECT jsonb_agg(e.event ORDER BY e.seq) FROM chat_events e WHERE e.run_id=r.run_id
-      ), '[]'::jsonb) AS journal
+      ), '[]'::jsonb), NULL
       FROM chat_threads t JOIN chat_runs r ON r.run_id=t.run_id AND r.status='running'
-      WHERE t.id=$1`,
-      [threadId],
-    );
-    return rows[0]?.journal ?? null;
-  }
-
-  /** Compacted-per-run events of the thread's closed runs, oldest first. */
-  async closedRunEvents(threadId: string, excludeRunId?: string): Promise<BaseEvent[][]> {
-    const rows = await this.db.sql<{ events: BaseEvent[] }>(
-      `/* chat:closed-runs */ SELECT events FROM chat_runs
-      WHERE thread_id=$1 AND status<>'running' AND ($2::text IS NULL OR run_id<>$2)
-      ORDER BY position`,
+      WHERE t.id=$1 AND ($2::text IS NULL OR r.run_id<>$2)
+      ORDER BY position NULLS LAST`,
       [threadId, excludeRunId ?? null],
     );
-    return rows.map((row) => row.events);
+    const closed: BaseEvent[][] = [];
+    let running: BaseEvent[] | null = null;
+    for (const row of rows) {
+      if (row.journal) running = row.journal;
+      else if (row.events) closed.push(row.events);
+    }
+    return { closed, running };
   }
 
   /** Flags the thread's current run (optionally only runId) to stop; true when one is locked. */

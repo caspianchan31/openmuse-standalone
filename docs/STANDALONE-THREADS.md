@@ -36,7 +36,7 @@ For production, point `DATABASE_URL` at Postgres and back it up like any other a
 | Delete a thread | Yes, refused with 409 while it is replying | Yes |
 | Reload replays the conversation | Yes (`connectAgent` replays saved runs) | Yes |
 | Reload during a reply resumes the reply | Yes, when the reply runs in the same API process (also one that is just starting) | Yes |
-| A second send while a reply runs | 409 `agent_thread_locked`, the app holds the queued message (no console error; the browser still lists the 409 request) | `AgentThreadLockedError`, same handling |
+| A second send while a reply runs | 409 `agent_thread_locked` before any SSE; the app holds the queued message, and neither the app nor CopilotKit logs an error. The browser itself still logs the refused request (in Chrome, one console line: "Failed to load resource: the server responded with a status of 409 (Conflict)") | `AgentThreadLockedError`, same handling |
 | Stop | Yes; the reply stops streaming at once and what it said so far is saved | Yes |
 | Thread list refreshes live on other devices | No: the menu refetches each time it opens | Yes (realtime metadata) |
 | Live tail of a reply running in another API process | No: a reload there shows the reply's progress so far, then ends | Yes |
@@ -86,11 +86,17 @@ Invalid input is `400`; a missing thread, another owner's thread or a different 
 
 Each saved run starts with `RUN_STARTED` carrying only the messages that were new to the thread. Tools, context, state and forwarded properties in that input are not stored (tools and context are saved as empty lists, which the client requires on replay). Every saved `RUN_FINISHED` carries its thread and run ids.
 
+Text Postgres cannot store, NUL characters and unpaired UTF-16 surrogates (a reply cut in the middle of an emoji), is saved with U+FFFD in its place; the live stream is unchanged.
+
 A run's state events are saved as one `STATE_SNAPSHOT` of the state it ended with: the state it began with plus its `STATE_DELTA` patches. A patch that cannot be applied (a path that does not exist) is dropped, as the agent and the app skip it with a warning, so it never keeps a reply from being saved or replayed, or its thread from being freed.
 
 ## Replay
 
-`connectAgent` (a reload, or opening a thread) receives the thread's saved replies, compacted, then the reply in progress from its start if this process is running it. A connect that arrives just after a send was accepted but before the reply began waits for the reply and follows it.
+`connectAgent` (a reload, or opening a thread) receives the thread's saved replies, compacted, then the reply in progress from its start if this process is running it, until that reply is saved. A connect that arrives just after a send was accepted but before the reply began waits for the reply and follows it.
+
+The saved replies are read in one statement, which also reads the journal of a reply running in another API process, so a reply saved in between is not lost. If a reply begins on the thread in this process while that read runs, the read may not match what the process is running: with `DATABASE_URL` it can answer from a snapshot taken before the reply was saved, or after the reply began in the database but before the process registered it. The connect then waits until the reply is registered and reads again, so the reply is sent once, and followed live while it runs.
+
+If the history cannot be read (the database is unavailable, or replies kept beginning during 10 reads in a row), the connect ends with a single `RUN_ERROR` with code `history_unavailable` ("This conversation could not be loaded. Try again."). The app treats it as a failed load, not as a replayed past failure: it shows "Could not load conversation" with **Retry loading conversation** instead of an empty or partial conversation. A plain stream error would not do this, because the runtime ends the SSE response normally when a runner's stream errors, which the app cannot tell from an empty thread.
 
 A failed or interrupted reply is replayed ending with `RUN_FINISHED` instead of its saved `RUN_ERROR`: the app shows no notice for a past failure after a reload, and replaying the error only made the client report it again (a console error per failed reply on every load). The stored reply keeps its `RUN_ERROR` and status, and `GET /threads/:id/events` returns it as stored.
 
@@ -119,7 +125,9 @@ The default deployment is still a single-owner workspace protected by one access
 
 - `tests/standalone-routes.test.ts`: runtime hooks and thread routes against in-memory stores, and the hooks inside the real CopilotKit runtime handler.
 - `tests/standalone-api.test.ts`: keyless `createApp` through the real runtime HTTP path with the sample agent: no Intelligence calls, main thread, SSE runs, listing, messages, replay, 409 before SSE, owner isolation, claim release, pagination and mutations.
-- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), a second connect that does not double the messages, a failed reply replayed without an error, and a send on a busy thread (409, or a lock found after the stream began) surfacing as the thread lock the app holds, without a console error.
+- `tests/standalone-client.test.ts`: the app's CopilotKit Core client against a keyless API served by `@hono/node-server` over real HTTP: an SSE run, replay after a reload through `connectAgent` (the client validates every replayed event), a second connect that does not double the messages, a history the server cannot read failing the load (then Retry loading it), a failed reply replayed without an error, and a send on a busy thread (409, or a lock found after the stream began) surfacing as the thread lock the app holds, without an error logged by the app or CopilotKit.
 - `tests/standalone-agui.test.ts`: keyless `createApp` with a remote AG-UI agent whose state patches only apply to the run's starting state, or to none: the runs finish, the state is saved, and the thread can be used and deleted.
-- `tests/standalone-runner.test.ts` and `tests/standalone-chat-store.test.ts`: persistence, replay after restart, durability boundary, concurrency, stop (including an agent whose `abortRun` is a no-op), shutdown caps, heartbeat, crash recovery at startup and by sweep, connect races, claim cleanup and retention.
+- `tests/standalone-runner.test.ts` and `tests/standalone-chat-store.test.ts`: persistence, replay after restart, durability boundary, concurrency, stop (including an agent whose `abortRun` is a no-op), shutdown caps, heartbeat, crash recovery at startup, by sweep (which leaves a lock whose holder heartbeats meanwhile) and by a claim that takes over a stale lock, connect races (a reply that begins, is registered or is saved during the history read, in this process or another), a history that cannot be read, claim cleanup (also at shutdown), text Postgres cannot store, list timestamps under any `DateStyle`, and retention.
 - `tests/rich-threads.test.ts` keeps covering Intelligence mode unchanged.
+
+The standalone tests use embedded PGlite. To run them through a pg Pool against real Postgres, as `DATABASE_URL` does, set `OPENMUSE_TEST_DATABASE_URL` to a server where they may create databases (each test file creates its own and drops it): `OPENMUSE_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres pnpm exec tsx --import ./tests/setup.ts --test tests/standalone-*.test.ts`. They never read `DATABASE_URL` itself.

@@ -10,13 +10,14 @@ import { type BaseEvent, EventType } from "@ag-ui/client";
 import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
 import { createApp } from "../apps/server/src/app.ts";
 import type { Config } from "../apps/server/src/config.ts";
-import { createStore, type Store } from "../apps/server/src/db.ts";
+import type { Store } from "../apps/server/src/db.ts";
 import type { StandaloneChat } from "../apps/server/src/standalone/index.ts";
 import {
   localThreadEndpoints,
   threadLockedMessage,
 } from "../apps/server/src/standalone/runtime-hooks.ts";
 import type { ThreadRecord, WireMessage } from "../apps/server/src/standalone/types.ts";
+import { createChatTestStore } from "./helpers/chat-database.ts";
 
 let db: Store, directory: string, token: string, otherToken: string;
 let app: Awaited<ReturnType<typeof createApp>>["app"];
@@ -96,7 +97,7 @@ before(async () => {
   });
 
   directory = await mkdtemp(join(tmpdir(), "openmuse-standalone-api-"));
-  db = await createStore();
+  db = await createChatTestStore();
   const config: Config = {
     mode: "sample",
     port: 8787,

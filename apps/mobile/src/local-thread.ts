@@ -24,3 +24,12 @@ export function connectThread<A extends ResettableAgent, R>(
   }
   return copilotkit.connectAgent({ agent });
 }
+
+/**
+ * The agent whose thread-lock refusal a turn claims (runConversationTurn's holdOnLock): only for a
+ * queued message on a local thread. With Intelligence the app behaves exactly as upstream: the
+ * refusal is reported through CopilotKit's onError, and the message is held from that report.
+ */
+export function lockRefusalAgent<A>(agent: A, queued: boolean, localThreads: boolean) {
+  return queued && localThreads ? agent : undefined;
+}

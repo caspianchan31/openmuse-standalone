@@ -12,8 +12,9 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { type BaseEvent, EventType } from "@ag-ui/client";
 import { createApp } from "../apps/server/src/app.ts";
-import { createStore, type Store } from "../apps/server/src/db.ts";
+import type { Store } from "../apps/server/src/db.ts";
 import type { StandaloneChat } from "../apps/server/src/standalone/index.ts";
+import { createChatTestStore } from "./helpers/chat-database.ts";
 
 let db: Store, directory: string, token: string;
 let app: Awaited<ReturnType<typeof createApp>>["app"];
@@ -75,7 +76,7 @@ before(async () => {
   const { port } = server.address() as AddressInfo;
 
   directory = await mkdtemp(join(tmpdir(), "openmuse-standalone-agui-"));
-  db = await createStore();
+  db = await createChatTestStore();
   const created = await createApp(db, {
     mode: "sample",
     port: 8787,

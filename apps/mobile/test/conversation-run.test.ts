@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   ConversationTurnError,
   claimThreadLock,
+  historyUnavailable,
   isThreadLocked,
   type LockableAgent,
   replayedRunError,
@@ -160,6 +161,28 @@ test("reports for other agents and ignored codes do not fail the turn", async ()
     { code: replayedRunError, error: new Error("Saved failure") },
   ]);
   await runConversationTurn("openmuse-t-1", bus.execute, bus.subscribe, [replayedRunError]);
+});
+
+test("a history the server could not read fails the load although replayed errors are ignored", async () => {
+  // Standalone: CopilotKit reports the connect's RUN_ERROR as agent_run_error_event and copies its
+  // code onto the error.
+  const unavailable = Object.assign(
+    new Error("This conversation could not be loaded. Try again."),
+    {
+      code: historyUnavailable,
+    },
+  );
+  const bus = reporter([
+    { code: replayedRunError, error: new Error("Saved failure") },
+    { code: replayedRunError, error: unavailable },
+  ]);
+  await assert.rejects(
+    runConversationTurn("openmuse-t-1", bus.execute, bus.subscribe, [replayedRunError]),
+    (error: unknown) =>
+      error instanceof ConversationTurnError &&
+      error.cause === unavailable &&
+      error.code === replayedRunError,
+  );
 });
 
 test("a queued turn refused by the SSE 409 is held silently; anything else shows", () => {
