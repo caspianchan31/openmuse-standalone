@@ -10,7 +10,7 @@ First release of OpenMuse Standalone, based on upstream OpenMuse `main` at `1ac6
 - A run on a thread that is already replying answers `409 agent_thread_locked` before any SSE response; the app holds the queued message, as it does for Intelligence's `AgentThreadLockedError`.
 - Reloading replays a conversation, and reloading mid-reply resumes the reply. Stop saves the reply so far.
 - Replies are journaled while they run and saved before the app sees them finish. Replies cut off by a crash are recovered at startup (PGlite) or once their lock goes stale (Postgres). Shutdown saves replies in progress.
-- `CHAT_RETENTION_DAYS` optionally deletes finished replies older than that many days.
+- `CHAT_RETENTION_DAYS` (1–36500) optionally deletes finished replies older than that many days.
 - Settings shows where conversations are stored; `/api/workspace` reports `runtime.threads` (`local` or `intelligence`), and Rich Threads are on in both modes.
 - `pnpm dev:demo` runs without a key.
 - Docs: [README](README.md), [architecture](docs/STANDALONE.md), [local threads reference](docs/STANDALONE-THREADS.md), and upstream's README kept as [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md).

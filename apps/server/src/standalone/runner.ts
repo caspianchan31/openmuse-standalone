@@ -19,7 +19,7 @@ import {
   type AgentRunnerStopRequest,
   finalizeRunEvents,
 } from "@copilotkit/runtime/v2";
-import { type Observable, ReplaySubject } from "rxjs";
+import { Observable, ReplaySubject, type Subscription } from "rxjs";
 import { backgroundFailure } from "../log.ts";
 import type { BeginResult, ChatStore, ConnectHistory, DeadLocks, RunStatus } from "./chat-store.ts";
 import {
@@ -111,6 +111,9 @@ const delay = (ms: number) =>
     setTimeout(resolve, ms).unref();
   });
 
+/** The subscription a connect holds on a live run, and whether its client has gone. */
+type LiveTail = { subscription: Subscription | undefined; closed: boolean };
+
 export class LocalAgentRunner extends AgentRunner implements StandaloneRunControl {
   readonly instanceId: string;
   /** Backoff before each retry of a failed close statement (3 retries). Tests shorten it. */
@@ -162,7 +165,11 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
 
   connect(request: AgentRunnerConnectRequest): Observable<BaseEvent> {
     const subject = new ReplaySubject<BaseEvent>(Infinity);
-    void this.replay(request.threadId, subject).catch((error) => {
+    // The live tail of a run in progress; dropped when the client goes away, so a client that
+    // disconnects does not keep the replayed history and every later event in memory until the
+    // run ends (a long reply with repeated reconnects would pile them up).
+    const tail: LiveTail = { subscription: undefined, closed: false };
+    void this.replay(request.threadId, subject, tail).catch((error) => {
       backgroundFailure("standalone chat connect", error);
       // The runtime ends the SSE response normally when this stream errors, so the app would take
       // what it received (often nothing) for the whole conversation. A RUN_ERROR with this code
@@ -170,7 +177,18 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
       subject.next(runError(historyUnavailableMessage, historyUnavailableCode));
       subject.complete();
     });
-    return subject.asObservable();
+    let subscribers = 0;
+    return new Observable<BaseEvent>((subscriber) => {
+      subscribers++;
+      const inner = subject.subscribe(subscriber);
+      return () => {
+        inner.unsubscribe();
+        if (--subscribers > 0) return;
+        tail.closed = true;
+        tail.subscription?.unsubscribe();
+        tail.subscription = undefined;
+      };
+    });
   }
 
   async isRunning(request: AgentRunnerIsRunningRequest): Promise<boolean> {
@@ -629,7 +647,11 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
 
   // ---- Connect ----
 
-  private async replay(threadId: string, subject: ReplaySubject<BaseEvent>) {
+  private async replay(
+    threadId: string,
+    subject: ReplaySubject<BaseEvent>,
+    tail: LiveTail = { subscription: undefined, closed: false },
+  ) {
     // A run this process claimed but has not begun yet (one statement away): wait for it, so the
     // connect tails it instead of finding the thread idle.
     const pending = this.claimed.get(threadId);
@@ -637,8 +659,10 @@ export class LocalAgentRunner extends AgentRunner implements StandaloneRunContro
     const { live, history } = await this.readHistory(threadId);
     for (const event of compactLeniently(history.closed.flatMap(replayedRun))) subject.next(event);
     if (live) {
-      // Its ReplaySubject replays it from the start and completes once it is saved.
-      live.subject.subscribe({
+      // Its ReplaySubject replays it from the start and completes once it is saved. A client that
+      // left while the history was read gets no tail at all.
+      if (tail.closed) return;
+      tail.subscription = live.subject.subscribe({
         next: (event) => subject.next(event),
         complete: () => subject.complete(),
         error: (error) => subject.error(error),

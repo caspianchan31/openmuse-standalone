@@ -181,6 +181,11 @@ export function messageIdsOf(events: BaseEvent[]): string[] {
   for (const event of events) {
     const messageId = (event as Loose).messageId;
     if (typeof messageId === "string") ids.add(messageId);
+    // An assistant message that only calls a tool has no TEXT_MESSAGE_START: its id is the tool
+    // call's parent. Without it the next run would store that message again as new.
+    const parentMessageId = (event as Loose).parentMessageId;
+    if (event.type === EventType.TOOL_CALL_START && typeof parentMessageId === "string")
+      ids.add(parentMessageId);
     if (event.type === EventType.RUN_STARTED) {
       const messages = (event as RunStartedEvent).input?.messages;
       if (Array.isArray(messages)) {

@@ -424,3 +424,16 @@ test("releasing a claim deletes a thread row that never ran; ran, named or archi
   assert.equal(await chats.isLocked("rel-other"), true);
   assert.equal(await chats.releaseClaim("rel-other", "o1"), true);
 });
+
+test("a message that only calls a tool counts as known through the tool call's parent", () => {
+  const ids = messageIdsOf([
+    {
+      type: EventType.TOOL_CALL_START,
+      toolCallId: "c1",
+      toolCallName: "search",
+      parentMessageId: "m-tool",
+    } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_START, messageId: "m-text", role: "assistant" } as BaseEvent,
+  ]);
+  assert.deepEqual(ids.sort(), ["m-text", "m-tool"]);
+});

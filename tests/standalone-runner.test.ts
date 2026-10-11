@@ -471,6 +471,40 @@ test("connect mid-run sends history, the current run from its start, then live e
   assert.deepEqual(await collect(runner.connect({ threadId: "t-nowhere" })).finished, []);
 });
 
+test("a client that leaves a connect mid-run releases its tail on the live run", async () => {
+  await chats.ensureThread("alice", "t-tail", "default");
+  const runner = make();
+  const pause = gate();
+  const run = collect(
+    runner.run(request(replyAgent("a1", ["Wor", "ld"], pause.promise), "t-tail", "tail-1")),
+  );
+  await waitFor(() => hasDelta(run.events, "Wor"), "run streaming");
+  const live = (
+    runner as unknown as { active: Map<string, { subject: { observers: unknown[] } }> }
+  ).active.get("t-tail");
+  assert.ok(live, "the run is live");
+  const before = live.subject.observers.length;
+  const events: BaseEvent[] = [];
+  const subscription = runner
+    .connect({ threadId: "t-tail" })
+    .subscribe((event) => events.push(event));
+  await waitFor(() => hasDelta(events, "Wor"), "connect tails the run");
+  assert.equal(live.subject.observers.length, before + 1, "the connect tails the run");
+  subscription.unsubscribe();
+  assert.equal(
+    live.subject.observers.length,
+    before,
+    "the tail is released when the client leaves",
+  );
+  // A client that leaves before the history read returns never tails at all.
+  const early = runner.connect({ threadId: "t-tail" }).subscribe(() => {});
+  early.unsubscribe();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(live.subject.observers.length, before);
+  pause.open();
+  assert.equal((await run.finished).at(-1)?.type, EventType.RUN_FINISHED);
+});
+
 test("stop: a local run aborts and is saved as stopped", async () => {
   await chats.ensureThread("alice", "t-stop", "default");
   const runner = make();
@@ -876,9 +910,10 @@ test("the heartbeat keeps a long reply's lock from being recovered by another in
     if (text.includes("chat:stale")) sweeps++;
     return original(text, params);
   });
-  const owner = make({ heartbeatMs: 10, staleAfterMs: 100, sweepMs: 60_000 });
+  // A stale window wide enough that a busy machine never delays a 10 ms heartbeat past it.
+  const owner = make({ heartbeatMs: 10, staleAfterMs: 1000, sweepMs: 60_000 });
   await owner.start();
-  const watcher = make({ heartbeatMs: 10, staleAfterMs: 100, sweepMs: 10 });
+  const watcher = make({ heartbeatMs: 10, staleAfterMs: 1000, sweepMs: 10 });
   const pause = gate();
   const run = collect(
     owner.run(request(replyAgent("a1", ["Hel", "lo"], pause.promise), "t-beat", "beat-1")),
@@ -887,7 +922,8 @@ test("the heartbeat keeps a long reply's lock from being recovered by another in
   await watcher.start();
   // Well past the stale threshold, with the watcher sweeping every 10 ms.
   const from = sweeps;
-  await waitFor(() => sweeps - from >= 20, "watcher sweeps");
+  const since = Date.now();
+  await waitFor(() => sweeps - from >= 20 && Date.now() - since > 1500, "watcher sweeps", 10_000);
   assert.equal((await runRow("beat-1"))?.status, "running");
   assert.equal(await chats.isLocked("t-beat"), true);
   pause.open();

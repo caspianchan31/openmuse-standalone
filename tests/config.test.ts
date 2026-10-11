@@ -77,7 +77,8 @@ test("readConfig starts without an Intelligence key and validates chat retention
   assert.equal(chatRetentionDays("30"), 30);
   assert.equal(chatRetentionDays(" 7 "), 7);
   assert.equal(chatRetentionDays("  "), undefined);
-  for (const value of ["0", "-1", "1.5", "soon", "1e3"])
+  assert.equal(chatRetentionDays("36500"), 36500);
+  for (const value of ["0", "-1", "1.5", "soon", "1e3", "36501", "3000000", "9999999999"])
     assert.throws(() => chatRetentionDays(value), /CHAT_RETENTION_DAYS/);
   delete process.env.CPK_INTELLIGENCE_API_KEY;
   process.env.CHAT_RETENTION_DAYS = "90";

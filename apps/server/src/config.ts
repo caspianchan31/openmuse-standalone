@@ -89,12 +89,17 @@ export function chatBackend(config: Pick<Config, "intelligenceApiKey">): ChatBac
 // Standalone: a missing or blank key selects local chat instead of failing startup.
 export function assertApiDeploymentConfig(_config: Config): void {}
 
-// Standalone: CHAT_RETENTION_DAYS is unset (keep forever) or a positive whole number of days.
+// Standalone: CHAT_RETENTION_DAYS is unset (keep forever) or a whole number of days from 1 to
+// 36500. Far larger values overflow Postgres timestamps in the purge statement, which would then
+// fail on every sweep.
+export const chatRetentionDaysMax = 36_500;
 export function chatRetentionDays(value = process.env.CHAT_RETENTION_DAYS): number | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
-  if (!/^\d+$/.test(trimmed) || Number(trimmed) < 1)
-    throw new Error("CHAT_RETENTION_DAYS must be a positive whole number of days");
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) < 1 || Number(trimmed) > chatRetentionDaysMax)
+    throw new Error(
+      `CHAT_RETENTION_DAYS must be a whole number of days from 1 to ${chatRetentionDaysMax}`,
+    );
   return Number(trimmed);
 }
 

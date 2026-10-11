@@ -53,7 +53,7 @@ Set `EXPO_PUBLIC_API_URL` to the API's public URL when building the web app. A s
 | `CPK_INTELLIGENCE_API_KEY` | unset | Unset or blank: **local mode**, conversations in this server's database. Set: upstream's CopilotKit Intelligence mode, unchanged. A wrong key reports errors; it never falls back to local mode. |
 | `DATABASE_URL` | unset | Unset: embedded PGlite in `DATA_DIR/postgres`. Set: that Postgres server. |
 | `DATA_DIR` | `.openmuse` | Embedded database, documents, signing key and browser profiles. Keep it private and back it up. |
-| `CHAT_RETENTION_DAYS` | unset (keep forever) | Local mode only: delete finished replies older than this many days. Must be a positive whole number. |
+| `CHAT_RETENTION_DAYS` | unset (keep forever) | Local mode only: delete finished replies older than this many days. A whole number from 1 to 36500. |
 
 Everything else (model, provider keys, Google, browser worker, computer) is configured as upstream: [.env.example](.env.example).
 
@@ -145,7 +145,7 @@ pnpm dev:web           # 另开一个终端，应用：http://localhost:8081
 - `CPK_INTELLIGENCE_API_KEY`：不设或留空即**本地模式**，对话存在本服务器数据库；设置后走上游 Intelligence 模式，行为不变。key 填错会报错，不会退回本地模式。
 - `DATABASE_URL`：不设则用内嵌 PGlite（`DATA_DIR/postgres`）；设置则连该 Postgres。
 - `DATA_DIR`：默认 `.openmuse`，存数据库、文件、签名密钥，需自行备份。
-- `CHAT_RETENTION_DAYS`：仅本地模式，删除超过该天数的已完成回复；不设则永久保留。
+- `CHAT_RETENTION_DAYS`：仅本地模式，删除超过该天数的已完成回复（1–36500 的整数）；不设则永久保留。
 
 ### PGlite 与 Postgres
 
