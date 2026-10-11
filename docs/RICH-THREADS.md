@@ -37,7 +37,7 @@ The Computer control below the avatar opens a persistent workspace with browser 
 
 Opening a session renews its short-lived console access. **Refresh connection** renews access without navigating; **Reopen** keeps the saved profile and uses the address in the input. The console reports live/disconnected state, preserves unsent text after an error, and pauses preview polling when hidden. Closing a session retains its profile and downloads.
 
-Run the browser worker using the `BROWSER_WORKER_URL` and `WORKER_TOKEN` setup in the [README](../README.md). Browser profiles persist on disk. The optional [Linux computer](COMPUTER.md) adds real command execution, saved output, editable files, and PDF transfer. CopilotKit's built-in conversation and task-worker tools use this same computer; remote AG-UI backends must supply their own equivalent tools. Interactive reservations still require user takeover; autonomous booking, checkout, graphical desktops and per-user VM isolation are not implemented. The OpenBot adapter remains an extension point for other computer backends.
+Run the browser worker using the `BROWSER_WORKER_URL` and `WORKER_TOKEN` setup in the [README](UPSTREAM-README.md#browser-worker). Browser profiles persist on disk. The optional [Linux computer](COMPUTER.md) adds real command execution, saved output, editable files, and PDF transfer. CopilotKit's built-in conversation and task-worker tools use this same computer; remote AG-UI backends must supply their own equivalent tools. Interactive reservations still require user takeover; autonomous booking, checkout, graphical desktops and per-user VM isolation are not implemented. The OpenBot adapter remains an extension point for other computer backends.
 
 ## Validation scope
 

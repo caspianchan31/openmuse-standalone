@@ -8,7 +8,9 @@ The demos follow a request from chat to the agent's inline browser, then show ho
 
 ## Guides
 
-- [Quick start and architecture](../README.md)
+- [Quick start (OpenMuse Standalone)](../README.md)
+- [Upstream OpenMuse README: features, deployment and configuration](UPSTREAM-README.md)
+- [OpenMuse Standalone architecture and upstream merging](STANDALONE.md)
 - [Native iOS / Android / web setup](../apps/mobile/README.md)
 - [Browser worker, API, persistence, and network boundary](../apps/worker/README.md)
 - [Linux computer, terminal, and workspace files](COMPUTER.md)

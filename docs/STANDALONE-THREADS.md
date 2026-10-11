@@ -119,7 +119,7 @@ History is kept until you delete a thread. With `CHAT_RETENTION_DAYS=N`, the swe
 
 Every thread belongs to the owner whose session first created it. Thread ids are global: an id held by another owner is answered exactly like a missing thread (`404`), on the thread routes and on run, connect and stop, and a refused run takes no lock. A run is only ever started after the hook has claimed its thread for the session owner: a run whose ids the hook cannot claim answers `400` instead of reaching the runtime. Owner fields in requests (`userId` and similar) are ignored; the owner always comes from the verified session.
 
-The default deployment is still a single-owner workspace protected by one access key (see the [README](../README.md)); per-owner isolation keeps thread data correct if more owners are added later.
+The default deployment is still a single-owner workspace protected by one access key (see [Configure the agent and Google](UPSTREAM-README.md#configure-the-agent-and-google)); per-owner isolation keeps thread data correct if more owners are added later.
 
 ## Validation
 
