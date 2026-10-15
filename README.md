@@ -1,6 +1,33 @@
+<div align="center">
+
 # OpenMuse Standalone
 
-**OpenMuse that runs entirely on your own server. No third-party chat cloud.**
+**Self-hosted OpenMuse: a personal AI agent whose conversations live in your own Postgres, not a hosted chat cloud.**
+
+*个人 AI agent 的独立版：对话存在你自己的 Postgres 里，不依赖托管聊天云。*
+
+[![CI](https://github.com/caspianchan31/openmuse-standalone/actions/workflows/ci.yml/badge.svg)](https://github.com/caspianchan31/openmuse-standalone/actions/workflows/ci.yml)
+[![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/caspianchan31/openmuse-standalone)](https://github.com/caspianchan31/openmuse-standalone/releases)
+![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
+
+[Quick start](#quick-start-no-key) · [Upstream vs Standalone](#upstream-vs-standalone) · [Known limits](#known-limits) · [Changelog](CHANGELOG.md) · [How it is built](docs/STANDALONE.md) · [中文](#中文)
+
+<img src="assets/openmuse-demo.gif" alt="OpenMuse running on iPhone in the fictional sample workspace: chat, agent computer, files, a PDF form, a finance summary, goals and ideas" width="300">
+
+</div>
+
+**In one line:** a fork of [CopilotKit's OpenMuse](https://github.com/CopilotKit/openmuse) that stores every conversation in your own Postgres (embedded PGlite by default), streams replies over SSE from your own server, and runs without a CopilotKit Intelligence key.
+
+<p align="center">
+  <img src="assets/document.png" alt="A filled PDF form open in the OpenMuse app" width="240">
+  &nbsp;&nbsp;
+  <img src="assets/finance.png" alt="OpenMuse finance summary card with a plan, income, spending and remaining balance" width="240">
+</p>
+
+<p align="center"><sub>The demo and screenshots show the OpenMuse app in its fictional sample workspace (iPhone). They show the app as a whole, not the chat storage that Standalone changes. <a href="assets/openmuse-demo.mp4">Full-quality MP4</a>.</sub></p>
+
+> **Alpha.** This is v0.1.0 of a fork of an alpha project. Expect rough edges; see [Status](#status) and [Known limits](#known-limits).
 
 > Looking for the full OpenMuse guide (demo, features, Render, Google, browser worker, Linux computer)? It is kept as [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md). This page covers what OpenMuse Standalone changes.
 
@@ -16,6 +43,28 @@ This fork keeps everything OpenMuse does and moves the chat layer in-house:
 ## Status
 
 **v0.1.0, released 2026-10-11.** Alpha, like upstream. Based on upstream OpenMuse `main` at `1ac68f3` (2026-10-06). See the [changelog](CHANGELOG.md) and [how it is built](docs/STANDALONE.md).
+
+## Upstream vs Standalone
+
+Compared against upstream OpenMuse `main` at `1ac68f3` (2026-10-06), the commit this fork is based on. Upstream may have changed since; see [issue #73](https://github.com/CopilotKit/openmuse/issues/73) for its current discussion.
+
+| | Upstream OpenMuse | OpenMuse Standalone |
+|---|---|---|
+| Where conversations are stored | CopilotKit Intelligence (hosted) | Your own Postgres or embedded PGlite (no key). With `CPK_INTELLIGENCE_API_KEY` set: Intelligence, as upstream |
+| `CPK_INTELLIGENCE_API_KEY` | Required to chat | Optional |
+| Chat without the key | Fails: "Main conversation is unavailable", "Failed to initialize thread" | Works: local mode |
+| If the hosted chat service is down | You cannot talk to your agent | Local mode does not use it |
+| How replies stream | Intelligence runtime | SSE straight from your server |
+| Reload mid-reply resumes the reply | Yes | Yes |
+| Thread list updates live on other devices | Yes | No: refreshes when the menu opens |
+| Memories | Yes | Not served in local mode |
+| Browser, Linux computer, Gmail/Calendar, tasks, ideas, goals | Yes | Unchanged from upstream |
+| Replies interrupted by a crash | n/a | Recovered at startup (PGlite) or after the lock goes stale (Postgres) |
+| Optional retention | n/a | `CHAT_RETENTION_DAYS` |
+| Maturity | Alpha | Alpha (v0.1.0, 2026-10-11); `render.yaml` has not been exercised on Render |
+| License | MIT | MIT (Intelligence is a separate service, not covered) |
+
+Local mode removes the hosted *chat* layer only. Model calls, optional Gmail/Calendar/E2B, default web search and SDK telemetry still behave as upstream; see [What still leaves your server](#what-still-leaves-your-server).
 
 ## Quick start (no key)
 
