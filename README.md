@@ -220,4 +220,4 @@ pnpm dev:web           # 另开一个终端，应用：http://localhost:8081
 - 因另一台设备正在回复而暂存的消息，稍后会带着本设备的对话副本发送，模型看不到另一台设备那一轮（保存的历史顺序正确，刷新可见）。
 - 本地模式不提供 Memories；两种模式都不自动命名线程（与上游一致）。
 
-架构与跟进上游的方法见 [docs/STANDALONE.md](docs/STANDALONE.md)。MIT 许可，与上游相同；CopilotKit Intelligence 是独立服务，不在本仓库及其 MIT 许可范围内。
+架构与跟进上游的方法见 [docs/STANDALONE.md](docs/STANDALONE.md)（[中文译文](docs/STANDALONE.zh-CN.md)）。MIT 许可，与上游相同；CopilotKit Intelligence 是独立服务，不在本仓库及其 MIT 许可范围内。
