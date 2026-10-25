@@ -11,7 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/caspianchan31/openmuse-standalone)](https://github.com/caspianchan31/openmuse-standalone/releases)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[Quick start](#quick-start-no-key) · [Upstream vs Standalone](#upstream-vs-standalone) · [Known limits](#known-limits) · [Changelog](CHANGELOG.md) · [How it is built](docs/STANDALONE.md) · [中文](#中文)
+[Quick start](#quick-start-no-key) · [Upstream vs Standalone](#upstream-vs-standalone) · [Postgres guide](docs/POSTGRES.md) · [Known limits](#known-limits) · [How it is built](docs/STANDALONE.md) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [中文](#中文)
 
 <img src="assets/openmuse-demo.gif" alt="OpenMuse running on iPhone in the fictional sample workspace: chat, agent computer, files, a PDF form, a finance summary, goals and ideas" width="300">
 
