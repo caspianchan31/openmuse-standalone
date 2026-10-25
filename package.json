@@ -6,7 +6,7 @@
   "license": "MIT",
   "packageManager": "pnpm@11.19.0",
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "scripts": {
     "dev": "tsx watch apps/server/src/index.ts",

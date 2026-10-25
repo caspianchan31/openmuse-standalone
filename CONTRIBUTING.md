@@ -4,7 +4,7 @@ OpenMuse is an MIT-licensed alpha. Contributions should make delegated work reli
 
 ## Local development
 
-1. Fork and clone the repository. Use Node 24 LTS and pnpm 11.19.0.
+1. Fork and clone the repository. Use Node 24 LTS and pnpm 11.19.0 (`engines` requires Node 24 or newer; on Node 22 the standalone runner tests are cancelled by the test runner, see issue #5).
 2. Run `pnpm install --frozen-lockfile` and copy `.env.example` to `.env`. Without an Intelligence key, conversations are stored in the API's own database ([local mode](docs/STANDALONE-THREADS.md)). To work on Intelligence mode, use `npx copilotkit@latest login` then `npx copilotkit@latest project select` to set `CPK_INTELLIGENCE_API_KEY`.
 3. Run `pnpm dev` and, in another terminal, `pnpm dev:web`.
 4. Use the fictional sample workspace for development and recordings. See [native setup](apps/mobile/README.md) for simulator/emulator builds.
