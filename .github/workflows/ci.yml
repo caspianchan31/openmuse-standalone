@@ -88,3 +88,33 @@ jobs:
         run: docker build -t openmuse-computer:local apps/computer
       - name: Verify computer isolation, persistence and cancellation
         run: pnpm test:computer
+  postgres:
+    # The standalone tests use embedded PGlite by default; this job runs them through a pg
+    # Pool against a real Postgres, as DATABASE_URL does in production (docs/STANDALONE-THREADS.md).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - run: pnpm install --frozen-lockfile
+      - name: Standalone tests against Postgres
+        env:
+          OPENMUSE_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        run: pnpm exec tsx --import ./tests/setup.ts --test tests/standalone-*.test.ts
