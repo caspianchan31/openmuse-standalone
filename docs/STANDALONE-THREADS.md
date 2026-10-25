@@ -24,7 +24,7 @@ A wrong key is not a fallback: with any non-blank key the API uses Intelligence 
 
 In local mode `CHAT_RETENTION_DAYS` must be a whole number from 1 to 36500 (larger values would overflow Postgres timestamps in the purge); the API refuses to start otherwise. Intelligence mode ignores it.
 
-For production, point `DATABASE_URL` at Postgres and back it up like any other application data. With embedded PGlite, conversations are in `DATA_DIR/postgres` next to the rest of OpenMuse's data; a host without a persistent disk loses them on redeploy.
+For production, point `DATABASE_URL` at Postgres and back it up like any other application data ([step-by-step guide](POSTGRES.md)). With embedded PGlite, conversations are in `DATA_DIR/postgres` next to the rest of OpenMuse's data; a host without a persistent disk loses them on redeploy.
 
 ## What each mode provides
 
