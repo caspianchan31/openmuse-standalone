@@ -111,7 +111,7 @@ Everything else (model, provider keys, Google, browser worker, computer) is conf
 - **Embedded PGlite (default).** Nothing to install. One process owns the database, so run the task worker inside the API (the default). A reply cut off by a crash is recovered as soon as the API starts again.
 - **Postgres (`DATABASE_URL`).** Recommended for a server you depend on. Back it up like any application data. A separate task worker (`pnpm start:worker`) can share it. A reply cut off by a crash is recovered after its lock goes stale, within about 30 to 45 seconds.
 
-The chat tables (`chat_threads`, `chat_runs`, `chat_events`) are created on startup in either database.
+The chat tables (`chat_threads`, `chat_runs`, `chat_events`) are created on startup in either database. A step-by-step walkthrough for `DATABASE_URL`, including the separate task worker, is in [docs/POSTGRES.md](docs/POSTGRES.md).
 
 ### With and without `CPK_INTELLIGENCE_API_KEY`
 
@@ -199,7 +199,7 @@ pnpm dev:web           # 另开一个终端，应用：http://localhost:8081
 ### PGlite 与 Postgres
 
 - **PGlite（默认）**：免安装；数据库只能被一个进程打开，任务 worker 跑在 API 进程里。崩溃中断的回复在 API 重启时立即恢复。
-- **Postgres**：长期使用推荐；可让独立任务 worker 共用。崩溃中断的回复在锁过期后约 30–45 秒内恢复。
+- **Postgres**：长期使用推荐；可让独立任务 worker 共用。崩溃中断的回复在锁过期后约 30–45 秒内恢复。配置 `DATABASE_URL` 的分步说明见 [docs/POSTGRES.md](docs/POSTGRES.md)（英文）。
 
 ### 有无 key 的区别
 
