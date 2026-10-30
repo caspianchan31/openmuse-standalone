@@ -6,6 +6,9 @@
 
 *个人 AI agent 的独立版：对话存在你自己的 Postgres 里，不依赖托管聊天云。*
 
+**Standalone is the open-source root of [Yuki](https://github.com/caspianchan31/yuki)**: AI teammates, each with its own computer.<br>
+*Standalone 是 [Yuki](https://github.com/caspianchan31/yuki) 的开源底座。Yuki：每个都有自己电脑的 AI 成员。*
+
 [![CI](https://github.com/caspianchan31/openmuse-standalone/actions/workflows/ci.yml/badge.svg)](https://github.com/caspianchan31/openmuse-standalone/actions/workflows/ci.yml)
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/caspianchan31/openmuse-standalone)](https://github.com/caspianchan31/openmuse-standalone/releases)
